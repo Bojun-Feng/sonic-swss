@@ -91,8 +91,7 @@ AclTableManager::AclTableManager(P4OidMapper *p4oidMapper, ResponsePublisherInte
 
 AclTableManager::~AclTableManager()
 {
-    sai_object_id_t udf_match_oid;
-    if (!m_p4OidMapper->getOID(SAI_OBJECT_TYPE_UDF_MATCH, P4_UDF_MATCH_DEFAULT, &udf_match_oid))
+    if (!m_p4OidMapper->existsOID(SAI_OBJECT_TYPE_UDF_MATCH, P4_UDF_MATCH_DEFAULT))
     {
         return;
     }
@@ -188,13 +187,13 @@ ReturnCodeOr<std::vector<sai_attribute_t>> AclTableManager::getUdfSaiAttrs(const
                << "UDF group " << QuotedVar(udf_field.group_id) << " does not exist";
     }
     sai_object_id_t udf_match_oid;
-    if (!m_p4OidMapper->getOID(SAI_OBJECT_TYPE_UDF_MATCH, P4_UDF_MATCH_DEFAULT, &udf_match_oid))
+    if (!m_p4OidMapper->existsOID(SAI_OBJECT_TYPE_UDF_MATCH, P4_UDF_MATCH_DEFAULT))
     {
         // Create the default UDF match
         LOG_AND_RETURN_IF_ERROR(createDefaultUdfMatch()
                                 << "Failed to create ACL UDF default match " << QuotedVar(P4_UDF_MATCH_DEFAULT));
-        m_p4OidMapper->getOID(SAI_OBJECT_TYPE_UDF_MATCH, P4_UDF_MATCH_DEFAULT, &udf_match_oid);
     }
+    m_p4OidMapper->getOID(SAI_OBJECT_TYPE_UDF_MATCH, P4_UDF_MATCH_DEFAULT, &udf_match_oid);
     std::vector<sai_attribute_t> udf_attrs;
     sai_attribute_t udf_attr;
     udf_attr.id = SAI_UDF_ATTR_GROUP_ID;
