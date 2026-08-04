@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="19" failures="0" disabled="0" errors="0" time="0.962" timestamp="2026-08-04T12:12:54.436" name="AllTests">
+  <testsuite name="IntfsOrchTest" tests="19" failures="0" disabled="0" skipped="0" errors="0" time="0.962" timestamp="2026-08-04T12:12:54.436">
+    <testcase name="IntfsOrchDeleteCreateRetry" file="intfsorch_ut.cpp" line="374" status="run" result="completed" time="0.062" timestamp="2026-08-04T12:12:54.436" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchVrfUpdate" file="intfsorch_ut.cpp" line="415" status="run" result="completed" time="0.055" timestamp="2026-08-04T12:12:54.499" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchSagEnableDisable" file="intfsorch_ut.cpp" line="473" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:54.554" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchVrfBindDeferredUntilIpRemoved" file="intfsorch_ut.cpp" line="516" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:54.602" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictRepairsRouteHeldWedge" file="intfsorch_ut.cpp" line="593" status="run" result="completed" time="0.05" timestamp="2026-08-04T12:12:54.651" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictSkipsRouteWithDeletedMainHash" file="intfsorch_ut.cpp" line="644" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:54.701" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictSkipsRouteWithPendingDel" file="intfsorch_ut.cpp" line="674" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:54.750" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictOncePerEpisode" file="intfsorch_ut.cpp" line="707" status="run" result="completed" time="0.05" timestamp="2026-08-04T12:12:54.798" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchNoRouteEvictionForNonRouteWedge" file="intfsorch_ut.cpp" line="745" status="run" result="completed" time="0.061" timestamp="2026-08-04T12:12:54.849" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictReplaysLeakedVrfRoute" file="intfsorch_ut.cpp" line="776" status="run" result="completed" time="0.049" timestamp="2026-08-04T12:12:54.911" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictDefaultRouteEpisode" file="intfsorch_ut.cpp" line="818" status="run" result="completed" time="0.049" timestamp="2026-08-04T12:12:54.960" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictSaiFailureIsFailSafe" file="intfsorch_ut.cpp" line="848" status="run" result="completed" time="0.05" timestamp="2026-08-04T12:12:55.009" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchParkedRouteCleanedByLateDel" file="intfsorch_ut.cpp" line="884" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:55.059" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictHostRouteKeyFormat" file="intfsorch_ut.cpp" line="917" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:55.108" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictVrfVanishBeforeReplay" file="intfsorch_ut.cpp" line="944" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:55.157" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchFreshSetMergesWithParkedRoute" file="intfsorch_ut.cpp" line="994" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:55.206" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchRemovalMarkerClearedOnDroppedDel" file="intfsorch_ut.cpp" line="1031" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:55.254" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchMarkerSurvivesPerIpDel" file="intfsorch_ut.cpp" line="1053" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:55.301" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictionDeferredDuringResync" file="intfsorch_ut.cpp" line="1079" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:55.350" classname="IntfsOrchTest" />
+  </testsuite>
+</testsuites>
