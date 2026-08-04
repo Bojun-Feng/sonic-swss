@@ -184,6 +184,8 @@ RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames,
     SWSS_LOG_NOTICE("Created link local ipv6 route %s to cpu", default_link_local_prefix.to_string().c_str());
 
     createRetryCache(APP_ROUTE_TABLE_NAME);
+
+    m_appRouteTable = make_unique<Table>(db, APP_ROUTE_TABLE_NAME);
 }
 
 std::string RouteOrch::getLinkLocalEui64Addr(void)
@@ -3068,6 +3070,220 @@ bool RouteOrch::removeRoutePrefix(const IpPrefix& prefix)
     m_routeStatePublisher.publishAsyncBatch();
     m_routeStatePublisher.flush();
     return ret;
+}
+
+bool RouteOrch::evictRoutesOnIntf(const string& alias, int refCount, size_t &evicted)
+{
+    SWSS_LOG_ENTER();
+
+    /* Called by IntfsOrch from consumer drain context when an interface
+     * removal is refused by references. Routes whose only next hop is the
+     * interface pin the RIF and can never resolve through it again, so they
+     * are removed and their APPL_DB intent is parked in the retry cache for
+     * replay once the interface is recreated. Returns false when the pass was
+     * not completed so the caller retries it on a later attempt. Safe to run
+     * from another orch's drain because orchagent drains orchs sequentially
+     * and the pass refuses to run unless the route bulker is empty. */
+
+    evicted = 0;
+
+    if (m_resync)
+    {
+        SWSS_LOG_NOTICE("Route resync in progress, defer route eviction on interface %s", alias.c_str());
+        return false;
+    }
+
+    if (gRouteBulker.creating_entries_count() != 0 ||
+        gRouteBulker.setting_entries_count() != 0 ||
+        gRouteBulker.removing_entries_count() != 0)
+    {
+        SWSS_LOG_WARN("Route bulker is not drained, defer route eviction on interface %s", alias.c_str());
+        return false;
+    }
+
+    auto consumer = getConsumerBase(APP_ROUTE_TABLE_NAME);
+    if (consumer == nullptr)
+    {
+        SWSS_LOG_ERROR("No %s consumer, defer route eviction on interface %s",
+                       APP_ROUTE_TABLE_NAME, alias.c_str());
+        return false;
+    }
+
+    /* Collect programmed single next hop interface routes on alias, in all
+     * VRFs. Next hop groups owned by NhgOrch and neighbor, overlay, SRv6 and
+     * MPLS next hops hold their RIF references through other objects and are
+     * out of scope. */
+    vector<pair<sai_object_id_t, IpPrefix>> routes;
+    for (const auto& table : m_syncdRoutes)
+    {
+        for (const auto& route : table.second)
+        {
+            const RouteNhg& nhg = route.second;
+            if (!nhg.nhg_index.empty() || nhg.nhg_key.getSize() != 1 ||
+                nhg.nhg_key.is_overlay_nexthop() || nhg.nhg_key.is_srv6_nexthop())
+            {
+                continue;
+            }
+
+            const NextHopKey& nexthop = *nhg.nhg_key.getNextHops().begin();
+            if (nexthop.isIntfNextHop() && !nexthop.isMplsNextHop() && nexthop.alias == alias)
+            {
+                routes.emplace_back(table.first, route.first);
+            }
+        }
+    }
+
+    /* Every reference on the interface must be accounted for by a route this
+     * pass can remove. Neighbors, NhgOrch owned groups and VNET objects hold
+     * their own references, and evicting routes cannot complete a removal they
+     * block: the interface would never be recreated, so the parked intent would
+     * never replay and the routes would be lost. Leave such a wedge exactly as
+     * it behaves today, and release any intent parked by an earlier pass so it
+     * returns to the consumer queue instead of waiting for an event that is not
+     * coming. */
+    if (routes.size() != (size_t)refCount)
+    {
+        SWSS_LOG_NOTICE("Interface %s holds %d reference(s) but only %zu are evictable route(s), skip eviction",
+                        alias.c_str(), refCount, routes.size());
+        notifyRetry(this, APP_ROUTE_TABLE_NAME, make_constraint(RETRY_CST_INTF, alias));
+        return true;
+    }
+
+    /* The ZMQ route channel persists the main hash asynchronously if at all,
+     * so it cannot be trusted as the latest intent: evict without replay and
+     * let the next zebra update reprogram the route. */
+    bool mainHashTrusted = dynamic_cast<ZmqConsumer *>(consumer) == nullptr;
+    bool completed = true;
+
+    for (const auto& route : routes)
+    {
+        const sai_object_id_t& vrf_id = route.first;
+        const IpPrefix& ip_prefix = route.second;
+
+        /* Rebuild the APPL_DB key the route was programmed from. fpmsyncd
+         * writes full mask prefixes without the /len suffix, so match that. */
+        string key = ip_prefix.isFullMask() ? ip_prefix.getIp().to_string() : ip_prefix.to_string();
+        if (vrf_id != gVirtualRouterId)
+        {
+            string vrf_name = m_vrfOrch->getVRFname(vrf_id);
+            if (vrf_name.empty())
+            {
+                SWSS_LOG_ERROR("Failed to get VRF name of route %s, skip eviction on interface %s",
+                               ip_prefix.to_string().c_str(), alias.c_str());
+                completed = false;
+                continue;
+            }
+            key = vrf_name + ":" + key;
+        }
+
+        /* The main hash holds the latest popped intent for the key. An absent
+         * hash or a pending DEL in m_toSync means the route is being deleted,
+         * and replaying it later would resurrect a deleted route. Note: with
+         * the ZMQ route channel the main hash is not persisted
+         * (dbPersistence=false), so eviction proceeds without replay there;
+         * the interface still unwedges and the route reprograms on the next
+         * zebra update. */
+        vector<FieldValueTuple> fvs;
+        bool replay = mainHashTrusted && m_appRouteTable->get(key, fvs);
+
+        /* The main hash is a field union: fpmsyncd omits fields at their
+         * default (routesync.cpp), and a pop only overwrites the fields it
+         * carries, so fields from an earlier shape of the prefix can survive.
+         * Replay only intent that still describes the route being evicted,
+         * otherwise a stale blackhole or next hop group field would program
+         * something else entirely. */
+        if (replay)
+        {
+            string ifname, nexthop_group, blackhole;
+            for (const auto& fv : fvs)
+            {
+                if (fvField(fv) == "ifname") ifname = fvValue(fv);
+                else if (fvField(fv) == "nexthop_group") nexthop_group = fvValue(fv);
+                else if (fvField(fv) == "blackhole") blackhole = fvValue(fv);
+            }
+            if (ifname != alias || !nexthop_group.empty() || blackhole == "true")
+            {
+                SWSS_LOG_NOTICE("Route %s intent no longer describes an interface route on %s, evict without replay",
+                                key.c_str(), alias.c_str());
+                replay = false;
+            }
+        }
+
+        if (replay)
+        {
+            auto pending = consumer->m_toSync.equal_range(key);
+            for (auto it = pending.first; it != pending.second; ++it)
+            {
+                if (kfvOp(it->second) == DEL_COMMAND)
+                {
+                    replay = false;
+                    break;
+                }
+            }
+        }
+
+        /* A task for this key already parked in the retry cache (e.g. a newer
+         * SET waiting on another constraint) carries the latest intent; do not
+         * park a second one, the cache holds at most a DEL and a SET per key. */
+        RetryCache* retryCache = getRetryCache(APP_ROUTE_TABLE_NAME);
+        if (replay && retryCache != nullptr && retryCache->getRetryMap().count(key) != 0)
+        {
+            replay = false;
+        }
+
+        /* Remove through the standard removal cycle so refcounts, CRM,
+         * counters, observers and APPL_STATE_DB stay consistent, the same
+         * sequence removeRoutePrefix uses. removeRoute returns true when there
+         * is nothing left to remove; false means the delete is in the bulker. */
+        RouteBulkContext ctx(key, false);
+        ctx.ip_prefix = ip_prefix;
+        ctx.vrf_id = vrf_id;
+        if (removeRoute(ctx))
+        {
+            continue;
+        }
+        gRouteBulker.flush();
+        removeRoutePost(ctx);
+
+        /* Confirm against the routing ledger: the entry is gone or is the
+         * neutered default route. A route that failed to remove still holds
+         * its references and must not be parked for replay. */
+        bool removed = true;
+        auto it_table = m_syncdRoutes.find(vrf_id);
+        if (it_table != m_syncdRoutes.end())
+        {
+            auto it_route = it_table->second.find(ip_prefix);
+            if (it_route != it_table->second.end() && it_route->second.nhg_key.getSize() != 0)
+            {
+                removed = false;
+            }
+        }
+        if (!removed)
+        {
+            SWSS_LOG_ERROR("Failed to evict route %s on interface %s", key.c_str(), alias.c_str());
+            completed = false;
+            continue;
+        }
+
+        evicted++;
+
+        if (replay)
+        {
+            addToRetry(APP_ROUTE_TABLE_NAME, Task(key, SET_COMMAND, fvs), make_constraint(RETRY_CST_INTF, alias));
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("Evicted route %s on interface %s with no intent to replay", key.c_str(), alias.c_str());
+        }
+    }
+
+    if (evicted != 0)
+    {
+        m_routeStatePublisher.publishAsyncBatch();
+        m_routeStatePublisher.flush();
+    }
+
+    return completed;
 }
 
 bool RouteOrch::createRemoteVtep(sai_object_id_t vrf_id, const NextHopKey &nextHop)
