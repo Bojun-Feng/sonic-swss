@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="19" failures="13" disabled="0" errors="0" time="0.985" timestamp="2026-08-04T12:12:41.301" name="AllTests">
+  <testsuite name="IntfsOrchTest" tests="19" failures="13" disabled="0" skipped="0" errors="0" time="0.984" timestamp="2026-08-04T12:12:41.301">
+    <testcase name="IntfsOrchDeleteCreateRetry" file="intfsorch_ut.cpp" line="374" status="run" result="completed" time="0.07" timestamp="2026-08-04T12:12:41.301" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchVrfUpdate" file="intfsorch_ut.cpp" line="415" status="run" result="completed" time="0.063" timestamp="2026-08-04T12:12:41.371" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchSagEnableDisable" file="intfsorch_ut.cpp" line="473" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:41.435" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchVrfBindDeferredUntilIpRemoved" file="intfsorch_ut.cpp" line="516" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:41.482" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictRepairsRouteHeldWedge" file="intfsorch_ut.cpp" line="593" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:41.530" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:612&#x0A;Value of: gRouteOrch-&gt;isRouteExists(gVirtualRouterId, IpPrefix(&quot;10.10.1.0/24&quot;))&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:612
+Value of: gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.1.0/24"))
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictSkipsRouteWithDeletedMainHash" file="intfsorch_ut.cpp" line="644" status="run" result="completed" time="0.063" timestamp="2026-08-04T12:12:41.578" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:661&#x0A;Value of: gRouteOrch-&gt;isRouteExists(gVirtualRouterId, IpPrefix(&quot;10.10.2.0/24&quot;))&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:661
+Value of: gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.2.0/24"))
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictSkipsRouteWithPendingDel" file="intfsorch_ut.cpp" line="674" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:41.641" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:693&#x0A;Value of: gRouteOrch-&gt;isRouteExists(gVirtualRouterId, IpPrefix(&quot;10.10.3.0/24&quot;))&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:693
+Value of: gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.3.0/24"))
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictOncePerEpisode" file="intfsorch_ut.cpp" line="707" status="run" result="completed" time="0.052" timestamp="2026-08-04T12:12:41.689" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:722&#x0A;Value of: gRouteOrch-&gt;isRouteExists(gVirtualRouterId, IpPrefix(&quot;10.10.4.0/24&quot;))&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:722
+Value of: gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.4.0/24"))
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchNoRouteEvictionForNonRouteWedge" file="intfsorch_ut.cpp" line="745" status="run" result="completed" time="0.058" timestamp="2026-08-04T12:12:41.742" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchEvictReplaysLeakedVrfRoute" file="intfsorch_ut.cpp" line="776" status="run" result="completed" time="0.049" timestamp="2026-08-04T12:12:41.800" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:802&#x0A;Value of: gRouteOrch-&gt;isRouteExists(blue_vrf_id, IpPrefix(&quot;10.55.0.0/24&quot;))&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:802
+Value of: gRouteOrch->isRouteExists(blue_vrf_id, IpPrefix("10.55.0.0/24"))
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictDefaultRouteEpisode" file="intfsorch_ut.cpp" line="818" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:41.850" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:833&#x0A;Expected equality of these values:&#x0A;  gRouteOrch-&gt;getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix(&quot;0.0.0.0/0&quot;)).getSize()&#x0A;    Which is: 1&#x0A;  0u&#x0A;    Which is: 0" type=""><![CDATA[intfsorch_ut.cpp:833
+Expected equality of these values:
+  gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix("0.0.0.0/0")).getSize()
+    Which is: 1
+  0u
+    Which is: 0]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictSaiFailureIsFailSafe" file="intfsorch_ut.cpp" line="848" status="run" result="completed" time="0.05" timestamp="2026-08-04T12:12:41.898" classname="IntfsOrchTest" />
+    <testcase name="IntfsOrchParkedRouteCleanedByLateDel" file="intfsorch_ut.cpp" line="884" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:41.949" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:896&#x0A;Value of: gIntfsOrch-&gt;isIntfChangeInProgress(&quot;Ethernet0&quot;)&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:896
+Value of: gIntfsOrch->isIntfChangeInProgress("Ethernet0")
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictHostRouteKeyFormat" file="intfsorch_ut.cpp" line="917" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:41.997" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:931&#x0A;Value of: gRouteOrch-&gt;isRouteExists(gVirtualRouterId, IpPrefix(&quot;10.9.9.9/32&quot;))&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:931
+Value of: gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.9.9.9/32"))
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictVrfVanishBeforeReplay" file="intfsorch_ut.cpp" line="944" status="run" result="completed" time="0.049" timestamp="2026-08-04T12:12:42.045" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:965&#x0A;Value of: gIntfsOrch-&gt;isIntfChangeInProgress(&quot;Ethernet0&quot;)&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:965
+Value of: gIntfsOrch->isIntfChangeInProgress("Ethernet0")
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchFreshSetMergesWithParkedRoute" file="intfsorch_ut.cpp" line="994" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:42.094" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:1006&#x0A;Expected equality of these values:&#x0A;  rc-&gt;getRetryMap().size()&#x0A;    Which is: 0&#x0A;  1u&#x0A;    Which is: 1" type=""><![CDATA[intfsorch_ut.cpp:1006
+Expected equality of these values:
+  rc->getRetryMap().size()
+    Which is: 0
+  1u
+    Which is: 1]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchRemovalMarkerClearedOnDroppedDel" file="intfsorch_ut.cpp" line="1031" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:42.142" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:1049&#x0A;Value of: gIntfsOrch-&gt;isIntfChangeInProgress(&quot;Ethernet0&quot;)&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:1049
+Value of: gIntfsOrch->isIntfChangeInProgress("Ethernet0")
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchMarkerSurvivesPerIpDel" file="intfsorch_ut.cpp" line="1053" status="run" result="completed" time="0.048" timestamp="2026-08-04T12:12:42.190" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:1071&#x0A;Value of: gIntfsOrch-&gt;isIntfChangeInProgress(&quot;Ethernet0&quot;)&#x0A;  Actual: false&#x0A;Expected: true" type=""><![CDATA[intfsorch_ut.cpp:1071
+Value of: gIntfsOrch->isIntfChangeInProgress("Ethernet0")
+  Actual: false
+Expected: true]]></failure>
+    </testcase>
+    <testcase name="IntfsOrchEvictionDeferredDuringResync" file="intfsorch_ut.cpp" line="1079" status="run" result="completed" time="0.047" timestamp="2026-08-04T12:12:42.238" classname="IntfsOrchTest">
+      <failure message="intfsorch_ut.cpp:1101&#x0A;Value of: gRouteOrch-&gt;isRouteExists(gVirtualRouterId, IpPrefix(&quot;10.10.9.0/24&quot;))&#x0A;  Actual: true&#x0A;Expected: false" type=""><![CDATA[intfsorch_ut.cpp:1101
+Value of: gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.9.0/24"))
+  Actual: true
+Expected: false]]></failure>
+    </testcase>
+  </testsuite>
+</testsuites>
