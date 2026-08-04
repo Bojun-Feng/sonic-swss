@@ -519,6 +519,13 @@ bool IntfsOrch::setIntf(const string& alias, sai_object_id_t vrf_id, const IpPre
             }
             m_syncdIntfses[alias] = intfs_entry;
             m_vrfOrch->increaseVrfRefCount(vrf_id);
+
+            /* The interface RIF is created; replay any routes that were
+             * evicted while its previous RIF removal was blocked. */
+            if (gRouteOrch != nullptr)
+            {
+                notifyRetry(gRouteOrch, APP_ROUTE_TABLE_NAME, make_constraint(RETRY_CST_INTF, alias));
+            }
         }
         else
         {
@@ -1167,6 +1174,8 @@ void IntfsOrch::doTask(Consumer &consumer)
             /* Cannot locate interface */
             if (!gPortsOrch->getPort(alias, port))
             {
+                m_removingIntfses.erase(alias);
+                m_pendingRouteEvictions.erase(alias);
                 it = consumer.m_toSync.erase(it);
                 continue;
             }
@@ -1174,6 +1183,8 @@ void IntfsOrch::doTask(Consumer &consumer)
             if (m_syncdIntfses.find(alias) == m_syncdIntfses.end())
             {
                 /* Cannot locate the interface */
+                m_removingIntfses.erase(alias);
+                m_pendingRouteEvictions.erase(alias);
                 it = consumer.m_toSync.erase(it);
                 continue;
             }
@@ -1199,6 +1210,11 @@ void IntfsOrch::doTask(Consumer &consumer)
 
                 if (vnet_orch->delIntf(alias, vnet_name, ip_prefix_in_key ? &ip_prefix : nullptr))
                 {
+                    if (!ip_prefix_in_key)
+                    {
+                        m_removingIntfses.erase(alias);
+                        m_pendingRouteEvictions.erase(alias);
+                    }
                     m_vnetInfses.erase(alias);
                     it = consumer.m_toSync.erase(it);
                 }
@@ -1212,12 +1228,50 @@ void IntfsOrch::doTask(Consumer &consumer)
             {
                 if (removeIntf(alias, port.m_vr_id, ip_prefix_in_key ? &ip_prefix : nullptr))
                 {
-                    m_removingIntfses.erase(alias);
+                    /* Only a completed interface removal ends the removal
+                     * episode; a per address DEL must not clear the marker. */
+                    if (!ip_prefix_in_key)
+                    {
+                        m_removingIntfses.erase(alias);
+                        m_pendingRouteEvictions.erase(alias);
+                    }
                     it = consumer.m_toSync.erase(it);
                 }
                 else
                 {
                     m_removingIntfses.insert(alias);
+
+                    /* Routes whose only next hop is this interface pin the RIF
+                     * and can never resolve through it again, so evict them and
+                     * park their intent for replay once the interface is
+                     * recreated; a stale route can otherwise wedge the removal
+                     * indefinitely. Only a removal refused by references can be
+                     * repaired this way: while addresses remain, removeIntf has
+                     * not reached the reference check yet. Use find() here, on a
+                     * partial removal failure the entry is already erased and
+                     * operator[] would recreate it. */
+                    auto it_intfs = m_syncdIntfses.find(alias);
+                    if (gRouteOrch != nullptr && it_intfs != m_syncdIntfses.end() &&
+                        it_intfs->second.ip_addresses.empty() && it_intfs->second.ref_count > 0)
+                    {
+                        /* Retry the eviction only when the reference count
+                         * changed since the last completed pass, so a wedge held
+                         * by something else does not rescan on every drain. */
+                        auto it_pending = m_pendingRouteEvictions.find(alias);
+                        if (it_pending == m_pendingRouteEvictions.end() ||
+                            it_pending->second != it_intfs->second.ref_count)
+                        {
+                            size_t evicted = 0;
+                            if (gRouteOrch->evictRoutesOnIntf(alias, it_intfs->second.ref_count, evicted))
+                            {
+                                it_intfs = m_syncdIntfses.find(alias);
+                                int ref_count = it_intfs != m_syncdIntfses.end() ? it_intfs->second.ref_count : 0;
+                                m_pendingRouteEvictions[alias] = ref_count;
+                                SWSS_LOG_NOTICE("Interface %s removal is blocked, evicted %zu route(s), remaining ref count %d",
+                                                alias.c_str(), evicted, ref_count);
+                            }
+                        }
+                    }
                     it++;
                     continue;
                 }
