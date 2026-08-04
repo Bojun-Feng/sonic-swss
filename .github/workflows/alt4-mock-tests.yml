@@ -1,0 +1,117 @@
+# Temporary validation workflow for the evict-and-requeue change.
+# Lives only on throwaway ci-alt4-validate* branches of the fork; it is not
+# part of the upstream change. It replicates the upstream Azure build
+# environment (sonic-slave container + dependency debs) and runs the
+# orchagent mock tests.
+name: alt4-mock-tests
+
+on:
+  push:
+    branches:
+      - 'ci-alt4-validate*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mock-tests:
+    if: ${{ !contains(github.event.head_commit.message, 'ci results') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    container:
+      image: sonicdev-microsoft.azurecr.io:443/sonic-slave-bookworm:master-amd64
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -xe
+          apt-get update
+          apt-get install -y libhiredis-dev libzmq3-dev swig libdbus-1-dev libteam-dev redis-server jq unzip curl
+          sed -i 's/notify-keyspace-events ""/notify-keyspace-events AKE/' /etc/redis/redis.conf
+          sed -ri 's/^# unixsocket/unixsocket/' /etc/redis/redis.conf
+          sed -ri 's/^unixsocketperm .../unixsocketperm 777/' /etc/redis/redis.conf
+          sed -ri 's/redis-server.sock/redis.sock/' /etc/redis/redis.conf
+          service redis-server restart || redis-server /etc/redis/redis.conf --daemonize yes
+          sleep 1
+          redis-cli -s /var/run/redis/redis.sock ping
+
+      - name: Download SONiC dependency artifacts
+        run: |
+          set -xe
+          AZP="https://dev.azure.com/mssonic/build/_apis/build"
+          dl() {
+            pipeline="$1"; artifact="$2"; outdir="$3"
+            defId=$(curl -fsSL "$AZP/definitions?name=$pipeline&api-version=7.0" | jq -r '.value[0].id')
+            buildId=$(curl -fsSL "$AZP/builds?definitions=$defId&branchName=refs/heads/master&statusFilter=completed&resultFilter=succeeded,partiallySucceeded&\$top=1&api-version=7.0" | jq -r '.value[0].id')
+            url=$(curl -fsSL "$AZP/builds/$buildId/artifacts?artifactName=$artifact&api-version=7.0" | jq -r '.resource.downloadUrl')
+            mkdir -p "$outdir"
+            curl -fsSL "$url" -o "$outdir.zip"
+            unzip -q "$outdir.zip" -d "$outdir"
+            rm -f "$outdir.zip"
+          }
+          mkdir -p download
+          cd download
+          dl Azure.sonic-swss-common sonic-swss-common-bookworm swsscommon
+          dl Azure.sonic-sairedis sonic-sairedis-bookworm sairedis
+          dl Azure.sonic-buildimage.common_libs common-lib common
+          dl sonic-net.sonic-dash-api sonic-dash-api dash
+          dl sonic-net.sonic-platform-vpp vpp-bookworm vpp
+
+      - name: Install SONiC dependency debs
+        run: |
+          set -xe
+          cd download
+          dpkg -i $(find common -type f -name '*.deb' -path '*bookworm*' ! -name 'libpcre3*') || apt-get -f install -y
+          dpkg -i $(find dash -type f -name 'libdashapi*.deb') || apt-get -f install -y
+          VPP_INSTALL_SKIP_SYSCTL=1 dpkg -i $(find vpp -type f -name '*.deb' ! -name '*-dbg*') || VPP_INSTALL_SKIP_SYSCTL=1 apt-get -f install -y
+          dpkg -i $(find swsscommon -type f \( -name 'libswsscommon_*_amd64.deb' -o -name 'libswsscommon-dev_*_amd64.deb' \)) || apt-get -f install -y
+          dpkg -i $(find sairedis -type f \( -name 'libsaivs_*.deb' -o -name 'libsaivs-dev_*.deb' -o -name 'libsairedis_*.deb' -o -name 'libsairedis-dev_*.deb' -o -name 'libsaimetadata_*.deb' -o -name 'libsaimetadata-dev_*.deb' \) ! -name '*-dbg*') || apt-get -f install -y
+
+      - name: Build orchagent mock tests
+        run: |
+          set -xe
+          ./autogen.sh
+          ./configure --prefix=/usr
+          make -j"$(nproc)" -C tests/mock_tests tests
+
+      - name: Run IntfsOrch suite
+        run: |
+          set -xe
+          cd tests/mock_tests
+          ./tests --gtest_filter='IntfsOrchTest.*' --gtest_output=xml:intfsorch_tr.xml
+
+      - name: Run RouteOrch suite
+        run: |
+          set -xe
+          cd tests/mock_tests
+          ./tests --gtest_filter='RouteOrchTest.*' --gtest_output=xml:routeorch_tr.xml
+
+      - name: Run full orchagent mock test binary
+        run: |
+          set -xe
+          cd tests/mock_tests
+          ./tests --gtest_output=xml:full_tr.xml
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtest-results-${{ github.ref_name }}
+          path: tests/mock_tests/*_tr.xml
+          if-no-files-found: ignore
+
+      - name: Publish results to branch
+        if: always()
+        run: |
+          set -x
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "ci-results"
+          git config user.email "ci-results@invalid"
+          mkdir -p ci-results/${{ github.run_id }}
+          cp tests/mock_tests/*_tr.xml ci-results/${{ github.run_id }}/ 2>/dev/null || true
+          git add ci-results
+          git commit -m "ci results ${{ github.run_id }}" || exit 0
+          git push origin HEAD:${{ github.ref_name }} || true
