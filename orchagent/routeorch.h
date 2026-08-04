@@ -267,6 +267,7 @@ public:
     bool removeFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id);
     bool isRouteExists(sai_object_id_t vrf_id, const IpPrefix& prefix);
     bool removeRoutePrefix(const IpPrefix& prefix);
+    bool evictRoutesOnIntf(const std::string& alias, size_t &evicted);
 
     void addLinkLocalRouteToMe(sai_object_id_t vrf_id, IpPrefix linklocal_prefix);
     void delLinkLocalRouteToMe(sai_object_id_t vrf_id, IpPrefix linklocal_prefix);
@@ -299,6 +300,7 @@ private:
     std::set<NextHopKey> v6_active_default_route_nhops;
     shared_ptr<DBConnector> m_stateDb;
     unique_ptr<swss::Table> m_stateDefaultRouteTb;
+    unique_ptr<swss::Table> m_appRouteTable;
 
     RouteTables m_syncdRoutes;
     LabelRouteTables m_syncdLabelRoutes;

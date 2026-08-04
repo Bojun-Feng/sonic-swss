@@ -12,7 +12,8 @@ enum ConstraintType
     RETRY_CST_DUMMY,
     RETRY_CST_PIC,              // context doesn't exist
     RETRY_CST_PIC_REF,          // context refcnt nonzero
-    RETRY_CST_SAI_RESOURCE      // SAI resource exhaustion (INSUFFICIENT_RESOURCES, TABLE_FULL, etc.)
+    RETRY_CST_SAI_RESOURCE,     // SAI resource exhaustion (INSUFFICIENT_RESOURCES, TABLE_FULL, etc.)
+    RETRY_CST_INTF              // interface removal in progress, waiting for re-creation
 };
 
 static inline std::ostream& operator<<(std::ostream& os, ConstraintType t) {
@@ -21,6 +22,7 @@ static inline std::ostream& operator<<(std::ostream& os, ConstraintType t) {
         case ConstraintType::RETRY_CST_PIC:          return os << "RETRY_CST_PIC";
         case ConstraintType::RETRY_CST_PIC_REF:      return os << "RETRY_CST_PIC_REF";
         case ConstraintType::RETRY_CST_SAI_RESOURCE: return os << "RETRY_CST_SAI_RESOURCE";
+        case ConstraintType::RETRY_CST_INTF:         return os << "RETRY_CST_INTF";
         default:           return os << "UNKNOWN";
     }
 }
