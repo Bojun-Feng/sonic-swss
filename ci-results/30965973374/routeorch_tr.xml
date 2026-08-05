@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="22" failures="0" disabled="0" errors="0" time="0.913" timestamp="2026-08-05T01:28:31.231" name="AllTests">
+  <testsuite name="RouteOrchTest" tests="22" failures="0" disabled="0" skipped="0" errors="0" time="0.913" timestamp="2026-08-05T01:28:31.231">
+    <testcase name="RouteOrchTempRouteUniformSelection" file="routeorch_ut.cpp" line="482" status="run" result="completed" time="0.058" timestamp="2026-08-05T01:28:31.231" classname="RouteOrchTest" />
+    <testcase name="NhgOrchTempNhgUniformSelection" file="routeorch_ut.cpp" line="551" status="run" result="completed" time="0.041" timestamp="2026-08-05T01:28:31.289" classname="RouteOrchTest" />
+    <testcase name="RouteOrch_AddDeleteIPv6" file="routeorch_ut.cpp" line="598" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.331" classname="RouteOrchTest" />
+    <testcase name="RouteOrch_AddDeleteIPv4" file="routeorch_ut.cpp" line="705" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.372" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestDelSetSameNexthop" file="routeorch_ut.cpp" line="801" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.412" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestDelSetDiffNexthop" file="routeorch_ut.cpp" line="839" status="run" result="completed" time="0.039" timestamp="2026-08-05T01:28:31.452" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestDelSetDefaultRoute" file="routeorch_ut.cpp" line="859" status="run" result="completed" time="0.039" timestamp="2026-08-05T01:28:31.492" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestSetDelResponse" file="routeorch_ut.cpp" line="880" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.532" classname="RouteOrchTest" />
+    <testcase name="RouteOrchSetFullMaskSubnetPrefix" file="routeorch_ut.cpp" line="917" status="run" result="completed" time="0.039" timestamp="2026-08-05T01:28:31.572" classname="RouteOrchTest" />
+    <testcase name="RouteOrchLoopbackRoute" file="routeorch_ut.cpp" line="936" status="run" result="completed" time="0.039" timestamp="2026-08-05T01:28:31.612" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestInvalidEvpnRoute" file="routeorch_ut.cpp" line="955" status="run" result="completed" time="0.039" timestamp="2026-08-05T01:28:31.652" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestVrfRoute" file="routeorch_ut.cpp" line="983" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.692" classname="RouteOrchTest" />
+    <testcase name="RouteOrchSetItemNotFound" file="routeorch_ut.cpp" line="1010" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.732" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestDefaultRouteDelSetBulkerState" file="routeorch_ut.cpp" line="1037" status="run" result="completed" time="0.039" timestamp="2026-08-05T01:28:31.772" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestDefaultRouteDelSetSameBulk" file="routeorch_ut.cpp" line="1100" status="run" result="completed" time="0.039" timestamp="2026-08-05T01:28:31.812" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestIPv6DefaultRouteDelSet" file="routeorch_ut.cpp" line="1137" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.852" classname="RouteOrchTest" />
+    <testcase name="RouteOrchReachMaxNhgLimit" file="routeorch_ut.cpp" line="1194" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.892" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestTempRouteDesiredNhgKeyAssignment" file="routeorch_ut.cpp" line="1228" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.933" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestTempRouteNoReRandomizeWhenUnchanged" file="routeorch_ut.cpp" line="1288" status="run" result="completed" time="0.04" timestamp="2026-08-05T01:28:31.973" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestTempRouteReRandomizeWhenMembershipChanges" file="routeorch_ut.cpp" line="1402" status="run" result="completed" time="0.041" timestamp="2026-08-05T01:28:32.014" classname="RouteOrchTest" />
+    <testcase name="RouteOrchTestTempRouteToFullNhgLifecycle" file="routeorch_ut.cpp" line="1521" status="run" result="completed" time="0.047" timestamp="2026-08-05T01:28:32.056" classname="RouteOrchTest" />
+    <testcase name="RouteOrch_RemoveRoutePrefixRunsAsyncPublisherFlush" file="routeorch_ut.cpp" line="1728" status="run" result="completed" time="0.041" timestamp="2026-08-05T01:28:32.104" classname="RouteOrchTest" />
+  </testsuite>
+</testsuites>
