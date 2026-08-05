@@ -19,6 +19,11 @@ namespace intfsorch_test
     sai_router_interface_api_t *pold_sai_rif_api;
     sai_router_interface_api_t ut_sai_rif_api;
 
+    int remove_route_entries_count = 0;
+    bool fail_remove_route_entries = false;
+    sai_route_api_t *pold_sai_route_api;
+    sai_route_api_t ut_sai_route_api;
+
     sai_status_t _ut_create_router_interface(
             _Out_ sai_object_id_t *router_interface_id,
             _In_ sai_object_id_t switch_id,
@@ -26,14 +31,57 @@ namespace intfsorch_test
             _In_ const sai_attribute_t *attr_list)
     {
         ++create_rif_count;
-        return SAI_STATUS_SUCCESS;
+        return pold_sai_rif_api->create_router_interface(router_interface_id, switch_id, attr_count, attr_list);
     }
 
     sai_status_t _ut_remove_router_interface(
             _In_ sai_object_id_t router_interface_id)
     {
         ++remove_rif_count;
-        return SAI_STATUS_SUCCESS;
+        return pold_sai_rif_api->remove_router_interface(router_interface_id);
+    }
+
+    sai_status_t _ut_remove_route_entries(
+            _In_ uint32_t object_count,
+            _In_ const sai_route_entry_t *route_entry,
+            _In_ sai_bulk_op_error_mode_t mode,
+            _Out_ sai_status_t *object_statuses)
+    {
+        if (fail_remove_route_entries)
+        {
+            for (uint32_t i = 0; i < object_count; i++)
+            {
+                object_statuses[i] = SAI_STATUS_FAILURE;
+            }
+            return SAI_STATUS_FAILURE;
+        }
+        remove_route_entries_count += object_count;
+        return pold_sai_route_api->remove_route_entries(object_count, route_entry, mode, object_statuses);
+    }
+
+    int create_route_entries_count = 0;
+    sai_object_id_t last_created_route_nexthop = SAI_NULL_OBJECT_ID;
+
+    sai_status_t _ut_create_route_entries(
+            _In_ uint32_t object_count,
+            _In_ const sai_route_entry_t *route_entry,
+            _In_ const uint32_t *attr_count,
+            _In_ const sai_attribute_t **attr_list,
+            _In_ sai_bulk_op_error_mode_t mode,
+            _Out_ sai_status_t *object_statuses)
+    {
+        create_route_entries_count += object_count;
+        for (uint32_t i = 0; i < object_count; i++)
+        {
+            for (uint32_t j = 0; j < attr_count[i]; j++)
+            {
+                if (attr_list[i][j].id == SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID)
+                {
+                    last_created_route_nexthop = attr_list[i][j].value.oid;
+                }
+            }
+        }
+        return pold_sai_route_api->create_route_entries(object_count, route_entry, attr_count, attr_list, mode, object_statuses);
     }
 
     struct IntfsOrchTest : public ::testing::Test
@@ -49,6 +97,8 @@ namespace intfsorch_test
         //sai_remove_router_interface_fn old_remove_rif;
         void SetUp() override
         {
+            testing_db::reset();
+
             map<string, string> profile = {
                 { "SAI_VS_SWITCH_TYPE", "SAI_VS_SWITCH_TYPE_BCM56850" },
                 { "KV_DEVICE_MAC_ADDRESS", "20:03:04:05:06:00" }
@@ -61,6 +111,18 @@ namespace intfsorch_test
 
             sai_router_intfs_api->create_router_interface = _ut_create_router_interface;
             sai_router_intfs_api->remove_router_interface = _ut_remove_router_interface;
+
+            pold_sai_route_api = sai_route_api;
+            ut_sai_route_api = *sai_route_api;
+            sai_route_api = &ut_sai_route_api;
+
+            sai_route_api->remove_route_entries = _ut_remove_route_entries;
+            remove_route_entries_count = 0;
+            fail_remove_route_entries = false;
+
+            sai_route_api->create_route_entries = _ut_create_route_entries;
+            create_route_entries_count = 0;
+            last_created_route_nexthop = SAI_NULL_OBJECT_ID;
 
             m_app_db = make_shared<swss::DBConnector>("APPL_DB", 0);
             m_config_db = make_shared<swss::DBConnector>("CONFIG_DB", 0);
@@ -177,12 +239,13 @@ namespace intfsorch_test
                 APP_TUNNEL_DECAP_TABLE_NAME,
                 APP_TUNNEL_DECAP_TERM_TABLE_NAME
             };
-            auto* tunnel_decap_orch = new TunnelDecapOrch(m_app_db.get(), m_state_db.get(), m_config_db.get(), tunnel_tables);
+            ASSERT_EQ(gTunneldecapOrch, nullptr);
+            gTunneldecapOrch = new TunnelDecapOrch(m_app_db.get(), m_state_db.get(), m_config_db.get(), tunnel_tables);
             vector<string> mux_tables = {
                 CFG_MUX_CABLE_TABLE_NAME,
                 CFG_PEER_SWITCH_TABLE_NAME
             };
-            auto* mux_orch = new MuxOrch(m_config_db.get(), mux_tables, tunnel_decap_orch, gNeighOrch, gFdbOrch);
+            auto* mux_orch = new MuxOrch(m_config_db.get(), mux_tables, gTunneldecapOrch, gNeighOrch, gFdbOrch);
             gDirectory.set(mux_orch);
 
             ASSERT_EQ(gFgNhgOrch, nullptr);
@@ -291,6 +354,9 @@ namespace intfsorch_test
             delete gBufferOrch;
             gBufferOrch = nullptr;
 
+            delete gTunneldecapOrch;
+            gTunneldecapOrch = nullptr;
+
             delete gVrfOrch;
             gVrfOrch = nullptr;
 
@@ -298,7 +364,10 @@ namespace intfsorch_test
             gFlowCounterRouteOrch = nullptr;
 
             sai_router_intfs_api = pold_sai_rif_api;
+            sai_route_api = pold_sai_route_api;
             ut_helper::uninitSaiApi();
+
+            testing_db::reset();
         }
     };
 
@@ -488,5 +557,712 @@ namespace intfsorch_test
         syncd = gIntfsOrch->getSyncdIntfses();
         ASSERT_EQ(syncd["Loopback6"].vrf_id, gVrfOrch->getVRFid("Vrf-Blue"));
         ASSERT_EQ(gVrfOrch->getVrfRefCount("Vrf-Blue"), base_vrf_ref + 1);
+    }
+
+    // Regression tests for the VRF-rehome route/RIF race (route programmed
+    // against a RIF whose removal is pending). When an interface removal is
+    // blocked by route references, IntfsOrch asks RouteOrch to evict the
+    // pinning routes and park their APPL_DB intent in the retry cache; the
+    // parked intent replays after the interface is recreated. Without the
+    // repair the stale route wedges the removal indefinitely.
+
+    static void createIntf(const std::string& alias)
+    {
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({alias, "SET", { {"mtu", "9100"}}});
+        auto consumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_NE(gIntfsOrch->getRouterIntfsId(alias), SAI_NULL_OBJECT_ID);
+    }
+
+    static void programIntfRoute(const std::string& key, const std::string& alias, swss::DBConnector *appDb)
+    {
+        std::vector<FieldValueTuple> fvs = {
+            {"nexthop", "0.0.0.0"}, {"ifname", alias}, {"protocol", "static"}};
+        // The APPL_DB main hash holds the popped route intent
+        Table appRouteTable(appDb, APP_ROUTE_TABLE_NAME);
+        appRouteTable.set(key, fvs);
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({key, "SET", fvs});
+        auto consumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictRepairsRouteHeldWedge)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        sai_object_id_t old_rif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.1.0/24", "Ethernet0", m_app_db.get()));
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.1.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+
+        // Interface removal is blocked by the route: the route is evicted,
+        // its reference released and its intent parked for replay
+        auto base_remove_rif = remove_rif_count;
+        auto base_remove_route = remove_route_entries_count;
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.1.0/24")));
+        ASSERT_EQ(base_remove_route + 1, remove_route_entries_count);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_NE(rc, nullptr);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+        ASSERT_EQ(rc->getRetryMap().begin()->second.first, make_constraint(RETRY_CST_INTF, "Ethernet0"));
+
+        // The retained DEL completes on the next drain
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_EQ(base_remove_rif + 1, remove_rif_count);
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        // Recreating the interface resolves the constraint and the parked
+        // intent replays against the new RIF at the SAI level
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        sai_object_id_t new_rif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(new_rif, old_rif);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.1.0/24")));
+        ASSERT_EQ(last_created_route_nexthop, new_rif);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // Replay is one-shot: another drain changes nothing
+        auto base_create_route = create_route_entries_count;
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_EQ(base_create_route, create_route_entries_count);
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.1.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictSkipsRouteWithDeletedMainHash)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.2.0/24", "Ethernet0", m_app_db.get()));
+
+        // Simulate a route DEL already popped: the pop deletes the main hash
+        Table appRouteTable(m_app_db.get(), APP_ROUTE_TABLE_NAME);
+        appRouteTable.del("10.10.2.0/24");
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        // The route is evicted but nothing is parked: replaying it would
+        // resurrect a route that is being deleted
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.2.0/24")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.2.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictSkipsRouteWithPendingDel)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.3.0/24", "Ethernet0", m_app_db.get()));
+
+        // A DEL for the route is popped into m_toSync but not yet processed;
+        // the main hash may still be present at this point
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> routeEntries;
+        routeEntries.push_back({"10.10.3.0/24", "DEL", {}});
+        routeConsumer->addToSync(routeEntries);
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        // The route is evicted but nothing is parked behind the pending DEL
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.3.0/24")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // The pending DEL processes as a no-op and the removal completes
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.3.0/24")));
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictSkipsMixedHolderWedge)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.4.0/24", "Ethernet0", m_app_db.get()));
+
+        // A non-route reference on the same interface keeps the removal
+        // blocked whatever the eviction does, so evicting the route could not
+        // complete the removal and would strand it with no replay event
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+
+        auto base_remove_route = remove_route_entries_count;
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        // Behavior is exactly today's: the route keeps forwarding and the
+        // wedge persists, with no repeated scanning
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.4.0/24")));
+        ASSERT_EQ(base_remove_route, remove_route_entries_count);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 2);
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // Once the other holder releases, the reference count change is
+        // re-evaluated and the now repairable wedge is evicted exactly once
+        gIntfsOrch->decreaseRouterIntfsRefCount("Ethernet0");
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.4.0/24")));
+        ASSERT_EQ(base_remove_route + 1, remove_route_entries_count);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.4.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictReleasesParkedIntentWhenWedgeBecomesUnrepairable)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.11.0/24", "Ethernet0", m_app_db.get()));
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+
+        // A non-route holder takes a reference before the removal completes:
+        // the interface will never be recreated, so the parked intent must be
+        // released back to the consumer queue instead of waiting forever
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // The released task is retained by the interface guard, not lost, and
+        // programs once the interface comes back
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_EQ(routeConsumer->m_toSync.count("10.10.11.0/24"), 1u);
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.11.0/24")));
+
+        gIntfsOrch->decreaseRouterIntfsRefCount("Ethernet0");
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.11.0/24")));
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchNoEvictionWhileAddressesRemain)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0:10.88.0.1/24", "SET", { {"scope", "global"}, {"family", "IPv4"} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.10.0/24", "Ethernet0", m_app_db.get()));
+
+        // The whole interface DEL is tried before the address DEL and fails
+        // because addresses remain, not because of references: that failure
+        // must not evict anything
+        auto base_remove_route = remove_route_entries_count;
+        entries.clear();
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_EQ(base_remove_route, remove_route_entries_count);
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.10.0/24")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // Once the address is gone the removal reaches the reference check and
+        // the route wedge is repaired
+        entries.clear();
+        entries.push_back({"Ethernet0:10.88.0.1/24", "DEL", {}});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.10.0/24")));
+        ASSERT_EQ(base_remove_route + 1, remove_route_entries_count);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictSkipsStaleBlackholeIntent)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.12.0/24", "Ethernet0", m_app_db.get()));
+
+        // The main hash is a field union: a blackhole field left over from an
+        // earlier shape of the prefix must not be replayed as the intent
+        Table appRouteTable(m_app_db.get(), APP_ROUTE_TABLE_NAME);
+        appRouteTable.set("10.10.12.0/24", { {"nexthop", "0.0.0.0"}, {"ifname", "Ethernet0"},
+                                             {"protocol", "static"}, {"blackhole", "true"} });
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.12.0/24")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.12.0/24")));
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictReplaysAfterVrfRebind)
+    {
+        // The issue 28619 sequence end to end: an interface is unbound from a
+        // VRF, a racing route pins the old RIF, and the interface is recreated
+        // in a different VRF
+        std::deque<KeyOpFieldsValuesTuple> vrfEntries;
+        vrfEntries.push_back({"Vrf-Blue", "SET", { {"NULL", "NULL"}}});
+        auto vrfConsumer = dynamic_cast<Consumer *>(gVrfOrch->getExecutor(APP_VRF_TABLE_NAME));
+        vrfConsumer->addToSync(vrfEntries);
+        static_cast<Orch *>(gVrfOrch)->doTask();
+        ASSERT_TRUE(gVrfOrch->isVRFexists("Vrf-Blue"));
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        sai_object_id_t old_rif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.13.0/24", "Ethernet0", m_app_db.get()));
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.13.0/24")));
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        // Rebind into Vrf-Blue: the RIF is recreated in the new VRF and the
+        // parked intent replays against it
+        entries.clear();
+        entries.push_back({"Ethernet0", "SET", { {"vrf_name", "Vrf-Blue"}, {"mtu", "9100"} }});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        sai_object_id_t new_rif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(new_rif, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(new_rif, old_rif);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").vrf_id, gVrfOrch->getVRFid("Vrf-Blue"));
+
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.13.0/24")));
+        ASSERT_EQ(last_created_route_nexthop, new_rif);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_TRUE(gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME)->getRetryMap().empty());
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchNoRouteEvictionForNonRouteWedge)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet4"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.5.0/24", "Ethernet4", m_app_db.get()));
+
+        // Ethernet0 is blocked by a non-route reference: no route eviction
+        // may happen anywhere
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+
+        auto base_remove_route = remove_route_entries_count;
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_EQ(base_remove_route, remove_route_entries_count);
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.5.0/24")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // Same behavior as before the fix: the removal completes once the
+        // reference is released
+        gIntfsOrch->decreaseRouterIntfsRefCount("Ethernet0");
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.5.0/24")));
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictReplaysLeakedVrfRoute)
+    {
+        // Route leaked into another VRF with an interface next hop: it must
+        // program normally, and an eviction episode must replay it unchanged
+        std::deque<KeyOpFieldsValuesTuple> vrfEntries;
+        vrfEntries.push_back({"Vrf-Blue", "SET", { {"NULL", "NULL"}}});
+        auto vrfConsumer = dynamic_cast<Consumer *>(gVrfOrch->getExecutor(APP_VRF_TABLE_NAME));
+        vrfConsumer->addToSync(vrfEntries);
+        static_cast<Orch *>(gVrfOrch)->doTask();
+        ASSERT_TRUE(gVrfOrch->isVRFexists("Vrf-Blue"));
+        sai_object_id_t blue_vrf_id = gVrfOrch->getVRFid("Vrf-Blue");
+        auto base_vrf_ref = gVrfOrch->getVrfRefCount("Vrf-Blue");
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("Vrf-Blue:10.55.0.0/24", "Ethernet0", m_app_db.get()));
+
+        // Nothing blocks a cross-VRF interface route outside a removal episode
+        ASSERT_TRUE(gRouteOrch->isRouteExists(blue_vrf_id, IpPrefix("10.55.0.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        ASSERT_FALSE(gRouteOrch->isRouteExists(blue_vrf_id, IpPrefix("10.55.0.0/24")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+        ASSERT_EQ(rc->getRetryMap().begin()->first, "Vrf-Blue:10.55.0.0/24");
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(gRouteOrch->isRouteExists(blue_vrf_id, IpPrefix("10.55.0.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_EQ(gVrfOrch->getVrfRefCount("Vrf-Blue"), base_vrf_ref + 1);
+        ASSERT_TRUE(gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME)->getRetryMap().empty());
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictDefaultRouteEpisode)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("0.0.0.0/0", "Ethernet0", m_app_db.get()));
+        ASSERT_EQ(gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix("0.0.0.0/0")).getSize(), 1u);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+
+        // The default route is neutered rather than removed, but the
+        // reference is released and the intent parked all the same
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        ASSERT_EQ(gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix("0.0.0.0/0")).getSize(), 0u);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_EQ(gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix("0.0.0.0/0")).getSize(), 1u);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_TRUE(gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME)->getRetryMap().empty());
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictSaiFailureIsFailSafe)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.6.0/24", "Ethernet0", m_app_db.get()));
+
+        // The eviction SAI removal fails: the route keeps its reference,
+        // nothing is parked and the wedge persists exactly as before the fix
+        fail_remove_route_entries = true;
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        fail_remove_route_entries = false;
+
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.6.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // The route DEL later arrives through the normal path and the
+        // removal converges
+        Table appRouteTable(m_app_db.get(), APP_ROUTE_TABLE_NAME);
+        appRouteTable.del("10.10.6.0/24");
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> routeEntries;
+        routeEntries.push_back({"10.10.6.0/24", "DEL", {}});
+        routeConsumer->addToSync(routeEntries);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchParkedRouteCleanedByLateDel)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.8.0/24", "Ethernet0", m_app_db.get()));
+
+        // Wedge and complete the removal: the parked intent outlives the episode
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+
+        // A route DEL arriving after parking evicts the parked intent
+        Table appRouteTable(m_app_db.get(), APP_ROUTE_TABLE_NAME);
+        appRouteTable.del("10.10.8.0/24");
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> routeEntries;
+        routeEntries.push_back({"10.10.8.0/24", "DEL", {}});
+        routeConsumer->addToSync(routeEntries);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+        static_cast<Orch *>(gRouteOrch)->doTask();
+
+        // Nothing replays once the interface is recreated
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.8.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictHostRouteKeyFormat)
+    {
+        // fpmsyncd writes full mask keys without the /len suffix; the parked
+        // intent must be read and replayed under exactly that key
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.9.9.9", "Ethernet0", m_app_db.get()));
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.9.9.9/32")));
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.9.9.9/32")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+        ASSERT_EQ(rc->getRetryMap().begin()->first, "10.9.9.9");
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.9.9.9/32")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictVrfVanishBeforeReplay)
+    {
+        std::deque<KeyOpFieldsValuesTuple> vrfEntries;
+        vrfEntries.push_back({"Vrf-Blue", "SET", { {"NULL", "NULL"}}});
+        auto vrfConsumer = dynamic_cast<Consumer *>(gVrfOrch->getExecutor(APP_VRF_TABLE_NAME));
+        vrfConsumer->addToSync(vrfEntries);
+        static_cast<Orch *>(gVrfOrch)->doTask();
+        sai_object_id_t blue_vrf_id = gVrfOrch->getVRFid("Vrf-Blue");
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("Vrf-Blue:10.56.0.0/24", "Ethernet0", m_app_db.get()));
+        ASSERT_TRUE(gRouteOrch->isRouteExists(blue_vrf_id, IpPrefix("10.56.0.0/24")));
+
+        // Wedge, evict and complete the removal, then delete the VRF while
+        // the intent is still parked
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        vrfEntries.clear();
+        vrfEntries.push_back({"Vrf-Blue", "DEL", {}});
+        vrfConsumer->addToSync(vrfEntries);
+        static_cast<Orch *>(gVrfOrch)->doTask();
+        ASSERT_FALSE(gVrfOrch->isVRFexists("Vrf-Blue"));
+
+        // The replayed task is retained like any route SET for a missing VRF
+        // (pre-existing retention semantics): no crash, no programming
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+        ASSERT_EQ(routeConsumer->m_toSync.count("Vrf-Blue:10.56.0.0/24"), 1u);
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+
+        // A later DEL for the key replaces the retained SET so the stale
+        // intent can never program even if the VRF returns
+        std::deque<KeyOpFieldsValuesTuple> routeEntries;
+        routeEntries.push_back({"Vrf-Blue:10.56.0.0/24", "DEL", {}});
+        routeConsumer->addToSync(routeEntries);
+        auto pending = routeConsumer->m_toSync.find("Vrf-Blue:10.56.0.0/24");
+        ASSERT_NE(pending, routeConsumer->m_toSync.end());
+        ASSERT_EQ(kfvOp(pending->second), DEL_COMMAND);
+        ASSERT_EQ(routeConsumer->m_toSync.count("Vrf-Blue:10.56.0.0/24"), 1u);
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchFreshSetMergesWithParkedRoute)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.7.0/24", "Ethernet0", m_app_db.get()));
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+
+        // A fresh SET for the parked key pulls the parked intent back into
+        // m_toSync and merges with it; the route programs exactly once after
+        // the interface is recreated
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> routeEntries;
+        routeEntries.push_back({"10.10.7.0/24", "SET",
+            { {"nexthop", "0.0.0.0"}, {"ifname", "Ethernet0"}, {"protocol", "kernel"} }});
+        routeConsumer->addToSync(routeEntries);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+        ASSERT_EQ(routeConsumer->m_toSync.count("10.10.7.0/24"), 1u);
+
+        // Without the interface the merged task is retained, not dropped
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_EQ(routeConsumer->m_toSync.count("10.10.7.0/24"), 1u);
+
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        auto base_create_route = create_route_entries_count;
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_EQ(base_create_route + 1, create_route_entries_count);
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.7.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchRemovalMarkerClearedOnDroppedDel)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        // Simulate the state after a partial removal failure: the interface
+        // entry is gone while the removal marker and the DEL task remain. The
+        // dropped DEL must clear the marker instead of fencing the alias
+        // forever.
+        gIntfsOrch->m_syncdIntfses.erase("Ethernet0");
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_TRUE(gIntfsOrch->m_pendingRouteEvictions.empty());
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchMarkerSurvivesPerIpDel)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0:10.77.0.1/24", "SET", { {"scope", "global"}, {"family", "IPv4"} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        // Whole-interface DEL is blocked while the address remains; the per
+        // address DEL that follows must not end the removal episode
+        entries.clear();
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        intfConsumer->addToSync(entries);
+        entries.clear();
+        entries.push_back({"Ethernet0:10.77.0.1/24", "DEL", {}});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        // The retained whole-interface DEL completes on the next drain
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().count("Ethernet0"), 0u);
+    }
+
+    TEST_F(IntfsOrchTest, IntfsOrchEvictionDeferredDuringResync)
+    {
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(programIntfRoute("10.10.9.0/24", "Ethernet0", m_app_db.get()));
+
+        // While a route resync is reconciling, the eviction is deferred, not
+        // forfeited: the route stays untouched and the episode keeps a
+        // pending eviction
+        gRouteOrch->m_resync = true;
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", { {} }});
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.9.0/24")));
+        auto rc = gRouteOrch->getRetryCache(APP_ROUTE_TABLE_NAME);
+        ASSERT_TRUE(rc->getRetryMap().empty());
+
+        // Once the resync ends the deferred eviction runs on the next attempt
+        gRouteOrch->m_resync = false;
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.9.0/24")));
+        ASSERT_EQ(rc->getRetryMap().size(), 1u);
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_NO_FATAL_FAILURE(createIntf("Ethernet0"));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(gRouteOrch->isRouteExists(gVirtualRouterId, IpPrefix("10.10.9.0/24")));
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 1);
+        ASSERT_TRUE(rc->getRetryMap().empty());
     }
 }
