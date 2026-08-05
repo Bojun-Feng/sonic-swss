@@ -101,6 +101,8 @@ private:
     unique_ptr<Table> m_vidToRidTable;
 
     std::set<std::string> m_removingIntfses;
+    /* alias -> router interface reference count at the last eviction pass */
+    std::map<std::string, int> m_pendingRouteEvictions;
 
     std::string getRifFlexCounterTableKey(std::string s);
 
