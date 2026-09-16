@@ -60,13 +60,16 @@ static const vector<sai_router_interface_stat_t> rifStatIds =
 };
 
 IntfsOrch::IntfsOrch(DBConnector *db, vector<table_name_with_pri_t> tableNames, VRFOrch *vrf_orch, DBConnector *chassisAppDb) :
-        Orch(db, tableNames), m_vrfOrch(vrf_orch)
+        Orch(db, tableNames), m_vrfOrch(vrf_orch), m_appIntfTable(db, APP_INTF_TABLE_NAME)
 {
     SWSS_LOG_ENTER();
 
     /* Initialize DB connectors */
     m_counter_db = shared_ptr<DBConnector>(new DBConnector("COUNTERS_DB", 0));
     m_asic_db = shared_ptr<DBConnector>(new DBConnector("ASIC_DB", 0));
+    m_rehomeStateDb = std::make_shared<DBConnector>("STATE_DB", 0);
+    m_rehomeStateTable = std::make_unique<Table>(m_rehomeStateDb.get(), "INTERFACE_REHOME_TABLE");
+    m_rehomeStateTable->set("__owner__", {{"epoch", m_rehomeEpoch}});
     /* Initialize COUNTER_DB tables */
     m_rifNameTable = unique_ptr<Table>(new Table(m_counter_db.get(), COUNTERS_RIF_NAME_MAP));
     m_rifTypeTable = unique_ptr<Table>(new Table(m_counter_db.get(), COUNTERS_RIF_TYPE_MAP));
@@ -197,7 +200,163 @@ void IntfsOrch::decreaseRouterIntfsRefCount(const string &alias)
 
 bool IntfsOrch::isIntfChangeInProgress(const string &alias)
 {
-    return m_removingIntfses.find(alias) != m_removingIntfses.end();
+    return m_removingIntfses.count(alias) || m_rehomeAdmissions.count(alias);
+}
+
+void IntfsOrch::reportRehomeAdmission(const string &alias, const RehomeAdmission &request,
+                                    const string &phase)
+{
+    const auto applied = m_syncdIntfses.find(alias);
+    Port port;
+    const bool hasRif = gPortsOrch->getPort(alias, port) && port.m_rif_id != SAI_NULL_OBJECT_ID;
+    vector<FieldValueTuple> fields = {
+        {"owner_id", request.id}, {"owner_phase", phase}, {"owner_epoch", m_rehomeEpoch},
+        {"old_vrf", m_vrfOrch->getVRFname(request.oldVrf)},
+        {"requested_vrf", request.target},
+        {"ref_count", applied == m_syncdIntfses.end() ? "0" : to_string(applied->second.ref_count)},
+        {"rif_id", sai_serialize_object_id(hasRif ? port.m_rif_id : SAI_NULL_OBJECT_ID)},
+        {"applied_vrf", applied == m_syncdIntfses.end() ? "" : m_vrfOrch->getVRFname(applied->second.vrf_id)}
+    };
+    vector<FieldValueTuple> previous;
+    m_rehomeStateTable->get(alias, previous);
+    map<string, string> oldFields(previous.begin(), previous.end());
+    bool changed = false;
+    for (const auto &field : fields)
+    {
+        changed |= !oldFields.count(fvField(field)) || oldFields[fvField(field)] != fvValue(field);
+    }
+    if (changed)
+    {
+        m_rehomeStateTable->set(alias, fields);
+    }
+}
+
+void IntfsOrch::removeRehomeAdmission(const string &alias)
+{
+    const auto &request = m_rehomeAdmissions.at(alias);
+    string ownerId, managerId;
+    if (!m_rehomeStateTable->hget(alias, "manager_id", managerId) &&
+        m_rehomeStateTable->hget(alias, "owner_id", ownerId) && ownerId == request.id)
+    {
+        // A queued retry must not erase fields owned by IntfMgr.
+        for (const auto &field : {"owner_id", "owner_phase", "owner_epoch", "old_vrf",
+                                  "requested_vrf", "ref_count", "rif_id", "applied_vrf"})
+            m_rehomeStateTable->hdel(alias, field);
+    }
+    m_vrfOrch->decreaseVrfRefCount(request.oldVrf);
+    m_rehomeAdmissions.erase(alias);
+    if (m_syncdIntfses.find(alias) == m_syncdIntfses.end())
+    {
+        m_removingIntfses.erase(alias);
+        m_rehomeIntfses.erase(alias);
+    }
+}
+
+bool IntfsOrch::processRehomeRequest(const string &alias, const string &id,
+                                    const string &phase, const string &target, sai_object_id_t vrf)
+{
+    auto entry = m_rehomeAdmissions.find(alias);
+    if (entry != m_rehomeAdmissions.end() && id.empty() && phase.empty())
+    {
+        string managerId;
+        if (!m_rehomeStateTable->hget(alias, "manager_id", managerId))
+        {
+            // A coalesced recreate can arrive without a preceding owner DEL.
+            SWSS_LOG_NOTICE("VRF rehome %s request %s superseded by recreation",
+                            alias.c_str(), entry->second.id.c_str());
+            removeRehomeAdmission(alias);
+            entry = m_rehomeAdmissions.end();
+        }
+    }
+    if (phase == "recover" && !id.empty())
+    {
+        // Replace a lost request without opening the admission fence.
+        if (entry == m_rehomeAdmissions.end() || entry->second.id != id)
+        {
+            m_vrfOrch->increaseVrfRefCount(vrf);
+            if (entry != m_rehomeAdmissions.end())
+                m_vrfOrch->decreaseVrfRefCount(entry->second.oldVrf);
+            m_rehomeAdmissions[alias] = RehomeAdmission{id, target, vrf, "recover"};
+        }
+        m_removingIntfses.insert(alias);
+        m_rehomeIntfses.insert(alias);
+        reportRehomeAdmission(alias, m_rehomeAdmissions.at(alias), "fenced");
+        return false;
+    }
+    if (entry == m_rehomeAdmissions.end())
+    {
+        if (phase.empty())
+        {
+            return true;
+        }
+        if (phase == "release")
+        {
+            string previousId, previousPhase;
+            m_rehomeStateTable->hget(alias, "owner_id", previousId);
+            m_rehomeStateTable->hget(alias, "owner_phase", previousPhase);
+            return id == previousId && previousPhase == "released";
+        }
+        const auto applied = m_syncdIntfses.find(alias);
+        if ((phase != "prepare" && phase != "restore") || id.empty() || applied == m_syncdIntfses.end() ||
+            applied->second.vrf_id != vrf || getRouterIntfsId(alias) == SAI_NULL_OBJECT_ID)
+        {
+            return false;
+        }
+        RehomeAdmission request{id, target, vrf, "prepare"};
+        entry = m_rehomeAdmissions.emplace(alias, request).first;
+        m_vrfOrch->increaseVrfRefCount(vrf);
+        m_removingIntfses.insert(alias);
+        m_rehomeIntfses.insert(alias);
+    }
+    auto &request = entry->second;
+
+    if (id != request.id)
+    {
+        return false;
+    }
+    if (phase == "release")
+    {
+        const auto applied = m_syncdIntfses.find(alias);
+        if (applied == m_syncdIntfses.end() || applied->second.vrf_id != vrf ||
+            getRouterIntfsId(alias) == SAI_NULL_OBJECT_ID)
+        {
+            return false;
+        }
+        m_removingIntfses.erase(alias);
+        m_rehomeIntfses.insert(alias);
+        reportRehomeAdmission(alias, request, "released");
+        m_vrfOrch->decreaseVrfRefCount(request.oldVrf);
+        m_rehomeAdmissions.erase(entry);
+        return true;
+    }
+    if (phase == "restore" && vrf == request.oldVrf)
+    {
+        request.phase = "restore";
+        m_rehomeIntfses.insert(alias);
+        if (m_syncdIntfses.find(alias) == m_syncdIntfses.end())
+            m_removingIntfses.erase(alias);
+        return true;
+    }
+    const auto applied = m_syncdIntfses.find(alias);
+    const bool ready = applied != m_syncdIntfses.end() && applied->second.ref_count == 0;
+    if (phase == "prepare" && request.phase == "prepare")
+    {
+        reportRehomeAdmission(alias, request, ready ? "ready" : "waiting");
+        return false;
+    }
+    if (phase == "apply" && (request.phase == "apply" || request.phase == "applied" ||
+                             (request.phase == "prepare" && ready)) &&
+        (request.target.empty() || m_vrfOrch->isVRFexists(request.target)) &&
+        vrf == (request.target.empty() ? gVirtualRouterId : m_vrfOrch->getVRFid(request.target)))
+    {
+        if (request.phase != "applied")
+        {
+            request.phase = "apply";
+        }
+        reportRehomeAdmission(alias, request, "applying");
+        return true;
+    }
+    return false;
 }
 
 bool IntfsOrch::setRouterIntfsMpls(const Port &port)
@@ -619,7 +778,8 @@ bool IntfsOrch::setIntf(const string& alias, sai_object_id_t vrf_id, const IpPre
     return true;
 }
 
-bool IntfsOrch::removeIntf(const string& alias, sai_object_id_t vrf_id, const IpPrefix *ip_prefix)
+bool IntfsOrch::removeIntf(const string& alias, sai_object_id_t vrf_id, const IpPrefix *ip_prefix,
+                         bool remove_subport)
 {
     SWSS_LOG_ENTER();
 
@@ -665,7 +825,7 @@ bool IntfsOrch::removeIntf(const string& alias, sai_object_id_t vrf_id, const Ip
             m_syncdIntfses.erase(alias);
             m_vrfOrch->decreaseVrfRefCount(vrf_id);
 
-            if (port.m_type == Port::SUBPORT)
+            if (remove_subport && port.m_type == Port::SUBPORT)
             {
                 if (!gPortsOrch->removeSubPort(alias))
                 {
@@ -742,6 +902,7 @@ void IntfsOrch::doTask(Consumer &consumer)
 
         const vector<FieldValueTuple>& data = kfvFieldsValues(t);
         string vrf_name = "", vnet_name = "", nat_zone = "";
+        string rehomeId, rehomePhase, rehomeTarget, rehomeEpoch;
         MacAddress mac;
 
         uint32_t mtu = 0;
@@ -780,6 +941,22 @@ void IntfsOrch::doTask(Consumer &consumer)
             else if (field == "vnet_name")
             {
                 vnet_name = value;
+            }
+            else if (field == "rehome_id")
+            {
+                rehomeId = value;
+            }
+            else if (field == "rehome_phase")
+            {
+                rehomePhase = value;
+            }
+            else if (field == "rehome_target")
+            {
+                rehomeTarget = value;
+            }
+            else if (field == "rehome_epoch")
+            {
+                rehomeEpoch = value;
             }
             else if (field == "mac_addr")
             {
@@ -886,6 +1063,17 @@ void IntfsOrch::doTask(Consumer &consumer)
         string op = kfvOp(t);
         if (op == SET_COMMAND)
         {
+            if (!rehomePhase.empty() && !rehomeEpoch.empty() && rehomeEpoch != m_rehomeEpoch)
+            {
+                ++it;
+                continue;
+            }
+            if (!is_lo && !ip_prefix_in_key && vnet_name.empty() &&
+                !processRehomeRequest(alias, rehomeId, rehomePhase, rehomeTarget, vrf_id))
+            {
+                ++it;
+                continue;
+            }
             if (is_lo)
             {
                 if (!ip_prefix_in_key)
@@ -1017,10 +1205,65 @@ void IntfsOrch::doTask(Consumer &consumer)
                     adminUp = port.m_admin_state_up;
                 }
 
+                auto applied = m_syncdIntfses.find(alias);
+                if (!ip_prefix_in_key && applied != m_syncdIntfses.end() &&
+                    applied->second.vrf_id == vrf_id && port.m_rif_id != SAI_NULL_OBJECT_ID &&
+                    m_rehomeIntfses.count(alias))
+                {
+                    // Keep request state until current prefixes replay.
+                    m_removingIntfses.erase(alias);
+                }
+                // Only an admitted request may replace an existing RIF binding.
+                if (!ip_prefix_in_key && applied != m_syncdIntfses.end() &&
+                    applied->second.vrf_id != vrf_id && m_rehomeAdmissions.count(alias) &&
+                    (rehomePhase == "apply" || rehomePhase == "restore"))
+                {
+                    m_rehomeIntfses.insert(alias);
+                    m_removingIntfses.insert(alias);
+                    const auto oldVrf = applied->second.vrf_id;
+                    if (applied->second.ref_count)
+                    {
+                        ++it;
+                        continue;
+                    }
+                    const auto oldPrefixes = applied->second.ip_addresses;
+                    bool prefixesRemoved = true;
+                    for (const auto &prefix : oldPrefixes)
+                    {
+                        if (!removeIntf(alias, oldVrf, &prefix))
+                        {
+                            prefixesRemoved = false;
+                        }
+                    }
+                    if (!prefixesRemoved || !removeIntf(alias, oldVrf, nullptr, false))
+                    {
+                        ++it;
+                        continue;
+                    }
+                    m_removingIntfses.erase(alias);
+                }
+
                 if (!setIntf(alias, vrf_id, ip_prefix_in_key ? &ip_prefix : nullptr, adminUp, mtu, loopbackAction))
                 {
                     it++;
                     continue;
+                }
+
+                if (!ip_prefix_in_key && m_rehomeIntfses.erase(alias))
+                {
+                    // Replay current INTF_TABLE addresses, not an earlier snapshot.
+                    vector<string> keys;
+                    m_appIntfTable.getKeys(keys);
+                    const string prefix = alias + ":";
+                    for (const auto &key : keys)
+                    {
+                        vector<FieldValueTuple> fields;
+                        if (key.compare(0, prefix.size(), prefix) == 0 &&
+                            m_appIntfTable.get(key, fields))
+                        {
+                            consumer.addToSync(KeyOpFieldsValuesTuple(key, SET_COMMAND, fields));
+                        }
+                    }
                 }
 
                 if (!ip_prefix_in_key && sagChanged) {
@@ -1133,10 +1376,29 @@ void IntfsOrch::doTask(Consumer &consumer)
                 setIntfProxyArp(alias, proxy_arp);
             }
 
+            auto admission = m_rehomeAdmissions.find(alias);
+            if (!ip_prefix_in_key && admission != m_rehomeAdmissions.end() &&
+                (rehomePhase == "apply" || rehomePhase == "restore"))
+            {
+                admission->second.phase = rehomePhase == "apply" ? "applied" : "restored";
+                reportRehomeAdmission(alias, admission->second, admission->second.phase);
+            }
+
             it = consumer.m_toSync.erase(it);
         }
         else if (op == DEL_COMMAND)
         {
+            if (!ip_prefix_in_key)
+            {
+                auto admission = m_rehomeAdmissions.find(alias);
+                if (admission != m_rehomeAdmissions.end())
+                {
+                    // Do not overwrite a newer request for the same alias.
+                    SWSS_LOG_NOTICE("Interface %s deletion supersedes rehome request %s",
+                                    alias.c_str(), admission->second.id.c_str());
+                    removeRehomeAdmission(alias);
+                }
+            }
             if (is_lo)
             {
                 if (!ip_prefix_in_key)
@@ -1182,6 +1444,21 @@ void IntfsOrch::doTask(Consumer &consumer)
             if (m_syncdIntfses.find(alias) == m_syncdIntfses.end())
             {
                 /* Cannot locate the interface */
+                if (!ip_prefix_in_key && port.m_type == Port::SUBPORT &&
+                    m_vnetInfses.find(alias) == m_vnetInfses.end())
+                {
+                    if (!gPortsOrch->removeSubPort(alias))
+                    {
+                        it++;
+                        continue;
+                    }
+                }
+                if (!ip_prefix_in_key)
+                {
+                    // Clear stale request markers after the failed replacement retires.
+                    m_removingIntfses.erase(alias);
+                    m_rehomeIntfses.erase(alias);
+                }
                 it = consumer.m_toSync.erase(it);
                 continue;
             }
@@ -1218,14 +1495,22 @@ void IntfsOrch::doTask(Consumer &consumer)
             }
             else
             {
+                if (!ip_prefix_in_key)
+                {
+                    // Hold the deletion fence across exceptions and address-row work.
+                    m_removingIntfses.insert(alias);
+                }
                 if (removeIntf(alias, port.m_vr_id, ip_prefix_in_key ? &ip_prefix : nullptr))
                 {
-                    m_removingIntfses.erase(alias);
+                    if (!ip_prefix_in_key)
+                    {
+                        m_removingIntfses.erase(alias);
+                        m_rehomeIntfses.erase(alias);
+                    }
                     it = consumer.m_toSync.erase(it);
                 }
                 else
                 {
-                    m_removingIntfses.insert(alias);
                     it++;
                     continue;
                 }
@@ -1558,6 +1843,14 @@ bool IntfsOrch::removeRouterIntfs(Port &port)
     sai_status_t status = sai_router_intfs_api->remove_router_interface(port.m_rif_id);
     if (status != SAI_STATUS_SUCCESS)
     {
+        if (m_rehomeIntfses.count(port.m_alias))
+        {
+            // Restore counter registration while SAI still owns the RIF.
+            m_rifsToAdd.push_back(port);
+            SWSS_LOG_NOTICE("Router interface %s removal deferred, rif:%s rv:%d",
+                            port.m_alias.c_str(), sai_serialize_object_id(port.m_rif_id).c_str(), status);
+            return false;
+        }
         SWSS_LOG_ERROR("Failed to remove router interface for port %s, rv:%d", port.m_alias.c_str(), status);
         if (handleSaiRemoveStatus(SAI_API_ROUTER_INTERFACE, status) != task_success)
         {

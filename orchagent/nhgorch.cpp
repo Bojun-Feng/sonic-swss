@@ -540,6 +540,10 @@ sai_object_id_t NextHopGroupMember::getNhId() const
 
     if (m_key.isIntfNextHop())
     {
+        if (gIntfsOrch->isIntfChangeInProgress(m_key.alias))
+        {
+            return SAI_NULL_OBJECT_ID;
+        }
         nh_id = gIntfsOrch->getRouterIntfsId(m_key.alias);
     }
     else if (gNeighOrch->hasNextHop(m_key))

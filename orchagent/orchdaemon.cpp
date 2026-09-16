@@ -1408,6 +1408,18 @@ bool OrchDaemon::warmRestartCheck()
     vector<string> ts;
     getTaskToSync(ts);
 
+    // A request can remain fenced without a queued task.
+    Table rehomes(m_stateDb, "INTERFACE_REHOME_TABLE");
+    vector<string> aliases;
+    rehomes.getKeys(aliases);
+    for (const auto &alias : aliases)
+    {
+        string outcome;
+        rehomes.hget(alias, "outcome", outcome);
+        if (outcome == "pending" || outcome == "recovering")
+            ts.push_back("interface rehome " + alias);
+    }
+
     if (ts.size() != 0)
     {
         SWSS_LOG_NOTICE("WarmRestart check found pending tasks: ");

@@ -2152,6 +2152,58 @@ namespace vnetorch_test
         }
     };
 
+    TEST_F(VNetOrchTest, RehomeDefersSubnetSetButAllowsDelete)
+    {
+        setVxlanTunnel("tunnel_v4", "10.1.0.32");
+        setVnet("Vnet1", "tunnel_v4", "10001", "");
+        createL3Interface("Ethernet0", "192.0.2.1/24");
+        const auto oldRif = rifOf("Ethernet0");
+        ASSERT_NE(oldRif, SAI_NULL_OBJECT_ID);
+        setVnetLocalRoute("Vnet1", "198.18.0.0/24", "Ethernet0", "0.0.0.0");
+        auto route = findRoute("198.18.0.0");
+        ASSERT_NE(route, nullptr);
+        ASSERT_EQ(route->next_hop_id, oldRif);
+        ASSERT_GT(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+
+        auto vrfs = dynamic_cast<Consumer *>(gVrfOrch->getExecutor(APP_VRF_TABLE_NAME));
+        vrfs->addToSync({{"VrfRed", SET_COMMAND, {{"empty", "empty"}}}});
+        static_cast<Orch *>(gVrfOrch)->doTask();
+        auto interfaces = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        Table status(m_state_db.get(), "INTERFACE_REHOME_TABLE");
+        status.set("Ethernet0", {{"manager_id", "req-1"}, {"manager_target", "VrfRed"},
+                                 {"outcome", "pending"}});
+        auto send = [&](const string &phase, const string &vrf) {
+            interfaces->addToSync({{"Ethernet0", SET_COMMAND,
+                {{"vrf_name", vrf}, {"rehome_id", "req-1"}, {"rehome_phase", phase},
+                 {"rehome_target", "VrfRed"}, {"rehome_epoch", gIntfsOrch->m_rehomeEpoch}}}});
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        };
+        send("prepare", "");
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_EQ(rifOf("Ethernet0"), oldRif);
+
+        setVnetLocalRoute("Vnet1", "198.19.0.0/24", "Ethernet0", "0.0.0.0");
+        auto routes = dynamic_cast<Consumer *>(m_vnetRouteOrch->getExecutor(APP_VNET_RT_TABLE_NAME));
+        ASSERT_EQ(routes->m_toSync.count("Vnet1:198.19.0.0/24"), 1u);
+        EXPECT_EQ(findRoute("198.19.0.0"), nullptr);
+        delVnetLocalRoute("Vnet1", "198.18.0.0/24");
+        EXPECT_EQ(findRoute("198.18.0.0"), nullptr);
+        EXPECT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").ref_count, 0);
+
+        send("apply", "VrfRed");
+        send("release", "VrfRed");
+        ASSERT_EQ(interfaces->m_toSync.count("Ethernet0"), 0u);
+        const auto newRif = rifOf("Ethernet0");
+        ASSERT_NE(newRif, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(newRif, oldRif);
+        static_cast<Orch *>(m_vnetRouteOrch.get())->doTask();
+        ASSERT_EQ(routes->m_toSync.count("Vnet1:198.19.0.0/24"), 0u);
+        route = findRoute("198.19.0.0");
+        ASSERT_NE(route, nullptr);
+        EXPECT_EQ(route->next_hop_id, newRif);
+        EXPECT_EQ(findRoute("198.18.0.0"), nullptr);
+    }
+
     // Minimal end-to-end check that the fixture drives VNetOrch: creating a VNET
     // that references a VXLAN tunnel programs a SAI virtual router for the VNET
     // (the mock-test equivalent of check_vnet_entry() asserting a new

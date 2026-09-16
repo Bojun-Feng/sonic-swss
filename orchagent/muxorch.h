@@ -175,6 +175,8 @@ public:
         return nbr_handler_type_;
     }
 
+    string getNeighborAlias() const { return nbr_handler_->getAlias(); }
+
 private:
     bool stateActive();
     bool stateInitActive();

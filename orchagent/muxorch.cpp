@@ -20,6 +20,7 @@
 #include "swssnet.h"
 #include "crmorch.h"
 #include "neighorch.h"
+#include "intfsorch.h"
 #include "portsorch.h"
 #include "aclorch.h"
 #include "routeorch.h"
@@ -2952,6 +2953,11 @@ bool MuxCableOrch::addOperation(const Request& request)
 
     auto state = request.getAttrString("state");
     auto mux_obj = mux_orch->getMuxCable(port_name);
+
+    // Keep activation queued before changing standby forwarding or dependent state.
+    if (state == muxStateValToString.at(MuxState::MUX_STATE_ACTIVE) && !mux_obj->isActive() &&
+        gDirectory.get<IntfsOrch*>()->isIntfChangeInProgress(mux_obj->getNeighborAlias()))
+        return false;
 
     try
     {

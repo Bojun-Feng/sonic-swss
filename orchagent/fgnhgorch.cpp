@@ -873,7 +873,7 @@ bool FgNhgOrch::setInactiveBankToNextAvailableActiveBank(FGNextHopGroupEntry *sy
         {
             std::string interface_alias = syncd_fg_route_entry->nhg_key.getNextHops().begin()->alias;
             sai_object_id_t rif_next_hop_id = m_intfsOrch->getRouterIntfsId(interface_alias);
-            if (rif_next_hop_id == SAI_NULL_OBJECT_ID)
+            if (rif_next_hop_id == SAI_NULL_OBJECT_ID || m_intfsOrch->isIntfChangeInProgress(interface_alias))
             {
                 SWSS_LOG_INFO("Failed to get rif next hop for %s", interface_alias.c_str());
                 return false;
@@ -1525,7 +1525,7 @@ bool FgNhgOrch::setFgNhg(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, const
         else
         {
             sai_object_id_t rif_next_hop_id = m_intfsOrch->getRouterIntfsId(next_hop_set.begin()->alias);
-            if (rif_next_hop_id == SAI_NULL_OBJECT_ID)
+            if (rif_next_hop_id == SAI_NULL_OBJECT_ID || m_intfsOrch->isIntfChangeInProgress(next_hop_set.begin()->alias))
             {
                 SWSS_LOG_INFO("Failed to get rif next hop %s for %s",
                         nextHops.to_string().c_str(), ipPrefix.to_string().c_str());

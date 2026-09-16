@@ -12,6 +12,7 @@
 
 #include <map>
 #include <set>
+#include <chrono>
 
 extern sai_object_id_t gVirtualRouterId;
 extern MacAddress gMacAddress;
@@ -61,7 +62,8 @@ public:
     bool setIntfLoopbackAction(const Port &port, string actionStr);
     bool getSaiLoopbackAction(const string &actionStr, sai_packet_action_t &action);
     bool setIntf(const string& alias, sai_object_id_t vrf_id = gVirtualRouterId, const IpPrefix *ip_prefix = nullptr, const bool adminUp = true, const uint32_t mtu = 0, string loopbackAction = "");
-    bool removeIntf(const string& alias, sai_object_id_t vrf_id = gVirtualRouterId, const IpPrefix *ip_prefix = nullptr);
+    bool removeIntf(const string& alias, sai_object_id_t vrf_id = gVirtualRouterId, const IpPrefix *ip_prefix = nullptr,
+                    bool remove_subport = true);
 
     void addIp2MeRoute(sai_object_id_t vrf_id, const IpPrefix &ip_prefix);
     void removeIp2MeRoute(sai_object_id_t vrf_id, const IpPrefix &ip_prefix);
@@ -85,6 +87,25 @@ private:
     std::vector<Port> m_rifsToAdd;
 
     VRFOrch *m_vrfOrch;
+    swss::Table m_appIntfTable;
+    std::set<std::string> m_rehomeIntfses;
+    struct RehomeAdmission
+    {
+        std::string id;
+        std::string target;
+        sai_object_id_t oldVrf;
+        std::string phase;
+    };
+    std::map<std::string, RehomeAdmission> m_rehomeAdmissions;
+    std::shared_ptr<DBConnector> m_rehomeStateDb;
+    std::unique_ptr<Table> m_rehomeStateTable;
+    std::string m_rehomeEpoch = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    bool processRehomeRequest(const std::string &alias, const std::string &id,
+                             const std::string &phase, const std::string &target,
+                             sai_object_id_t vrf);
+    void reportRehomeAdmission(const std::string &alias, const RehomeAdmission &request,
+                                const std::string &phase);
+    void removeRehomeAdmission(const std::string &alias);
     IntfsTable m_syncdIntfses;
     map<string, string> m_vnetInfses;
     MacAddress m_sagMac;

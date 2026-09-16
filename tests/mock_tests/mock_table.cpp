@@ -1,12 +1,19 @@
 #include "table.h"
+#include "schema.h"
 #include "producerstatetable.h"
 #include "producertable.h"
 #include "mock_table.h"
+#include <deque>
 #include <set>
 #include <memory>
 
 using TableDataT = std::map<std::string, std::vector<swss::FieldValueTuple>>;
 using TablesT = std::map<std::string, TableDataT>;
+
+namespace swss
+{
+    void merge_values(std::vector<FieldValueTuple> &existing_values, const std::vector<FieldValueTuple> &values);
+}
 
 namespace testing_db
 {
@@ -15,9 +22,101 @@ namespace testing_db
     TablesT gTables;
     std::map<int, TablesT> gDB;
 
+    struct StagedUpdate
+    {
+        std::vector<swss::FieldValueTuple> values;
+        bool erase = false;
+    };
+    using StagedTableT = std::map<std::string, StagedUpdate>;
+
+    static bool gProducerStaging = false;
+    static std::map<int, std::map<std::string, StagedTableT>> gStaged;
+    static std::map<int, std::map<std::string, std::vector<std::string>>> gStagedKeys;
+
     void reset()
     {
         gDB.clear();
+        discardProducerStaging();
+        gProducerStaging = false;
+    }
+
+    void enableProducerStaging(bool enabled)
+    {
+        gProducerStaging = enabled;
+    }
+
+    bool producerStagingEnabled()
+    {
+        return gProducerStaging;
+    }
+
+    void discardProducerStaging()
+    {
+        gStaged.clear();
+        gStagedKeys.clear();
+    }
+
+    size_t stagedProducerUpdates(int dbId, const std::string &tableName)
+    {
+        return gStagedKeys[dbId][tableName].size();
+    }
+
+    void stageProducerUpdate(int dbId, const std::string &tableName, const std::string &key,
+               const std::vector<swss::FieldValueTuple> &values, bool erase)
+    {
+        auto &staged = gStaged[dbId][tableName];
+        auto iter = staged.find(key);
+        if (iter == staged.end())
+        {
+            gStagedKeys[dbId][tableName].push_back(key);
+            staged[key] = StagedUpdate{values, erase};
+            return;
+        }
+        if (erase)
+        {
+            iter->second = StagedUpdate{{}, true};
+            return;
+        }
+        swss::merge_values(iter->second.values, values);
+    }
+
+    std::deque<swss::KeyOpFieldsValuesTuple> popProducerStaging(int dbId, const std::string &tableName)
+    {
+        std::deque<swss::KeyOpFieldsValuesTuple> popped;
+        auto &keys = gStagedKeys[dbId][tableName];
+        auto &staged = gStaged[dbId][tableName];
+        auto &table = gDB[dbId][tableName];
+        for (const auto &key : keys)
+        {
+            auto iter = staged.find(key);
+            if (iter == staged.end())
+            {
+                continue;
+            }
+            // Match consumer pop ordering: delete before merging staged fields.
+            if (iter->second.erase)
+            {
+                table.erase(key);
+            }
+            if (iter->second.values.empty())
+            {
+                popped.push_back(swss::KeyOpFieldsValuesTuple(key, DEL_COMMAND, {}));
+                continue;
+            }
+            auto existing = table.find(key);
+            if (existing == table.end())
+            {
+                table[key] = iter->second.values;
+            }
+            else
+            {
+                swss::merge_values(existing->second, iter->second.values);
+            }
+            popped.push_back(swss::KeyOpFieldsValuesTuple(key, SET_COMMAND, iter->second.values));
+        }
+        keys.clear();
+        staged.clear();
+        return popped;
     }
 }
 
@@ -161,6 +260,11 @@ namespace swss
                                  const std::string &op,
                                  const std::string &prefix)
     {
+        if (producerStagingEnabled())
+        {
+            stageProducerUpdate(m_pipe->getDbId(), getTableName(), key, values, false);
+            return;
+        }
         auto &table = gDB[m_pipe->getDbId()][getTableName()];
         auto iter = table.find(key);
         if (iter == table.end())
@@ -177,6 +281,11 @@ namespace swss
                                  const std::string &op,
                                  const std::string &prefix)
     {
+        if (producerStagingEnabled())
+        {
+            stageProducerUpdate(m_pipe->getDbId(), getTableName(), key, {}, true);
+            return;
+        }
         auto &table = gDB[m_pipe->getDbId()][getTableName()];
         table.erase(key);
     }

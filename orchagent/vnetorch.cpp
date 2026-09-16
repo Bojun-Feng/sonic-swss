@@ -1747,6 +1747,11 @@ bool VNetRouteOrch::doRouteTask<VNetVrfObject>(const string& vnet, IpPrefix& ipP
         return false;
     }
 
+    if (op == SET_COMMAND && is_subnet && gIntfsOrch->isIntfChangeInProgress(nh.ifname))
+    {
+        return false;
+    }
+
     set<sai_object_id_t> vr_set;
     auto& peer_list = vnet_orch_->getPeerList(vnet);
     auto vr_id = vrf_obj->getVRidIngress();

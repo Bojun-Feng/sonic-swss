@@ -3,11 +3,14 @@
 #undef private
 #include "gtest/gtest.h"
 #include "ut_helper.h"
+#include "swssnet.h"
+#include "sai_serialize.h"
 #include "mock_orchagent_main.h"
 #include "mock_table.h"
 #include <memory>
 #include <vector>
 
+extern sai_mpls_api_t *sai_mpls_api;
 
 
 namespace intfsorch_test
@@ -18,6 +21,8 @@ namespace intfsorch_test
     int remove_rif_count = 0;
     bool saw_loopback_action = false;
     bool fail_next_rif_set = false;
+    bool fail_next_rif_create = false;
+    bool fail_next_rif_remove = false;
     int loopback_action_set_count = 0;
     sai_packet_action_t last_loopback_action = SAI_PACKET_ACTION_FORWARD;
     sai_router_interface_api_t *pold_sai_rif_api;
@@ -30,6 +35,11 @@ namespace intfsorch_test
             _In_ const sai_attribute_t *attr_list)
     {
         ++create_rif_count;
+        if (fail_next_rif_create)
+        {
+            fail_next_rif_create = false;
+            return SAI_STATUS_INSUFFICIENT_RESOURCES;
+        }
         return pold_sai_rif_api->create_router_interface(
             router_interface_id, switch_id, attr_count, attr_list);
     }
@@ -38,7 +48,42 @@ namespace intfsorch_test
             _In_ sai_object_id_t router_interface_id)
     {
         ++remove_rif_count;
+        if (fail_next_rif_remove)
+        {
+            fail_next_rif_remove = false;
+            return SAI_STATUS_OBJECT_IN_USE;
+        }
         return pold_sai_rif_api->remove_router_interface(router_interface_id);
+    }
+
+    int hostif_keep_tag_count = 0;
+    int hostif_strip_tag_count = 0;
+    bool fail_next_hostif_vlan_tag_set = false;
+    sai_hostif_api_t *pold_sai_hostif_api;
+    sai_hostif_api_t ut_sai_hostif_api;
+
+    sai_status_t _ut_set_hostif_attribute(
+            _In_ sai_object_id_t hif_id,
+            _In_ const sai_attribute_t *attr)
+    {
+        if (attr->id == SAI_HOSTIF_ATTR_VLAN_TAG && fail_next_hostif_vlan_tag_set)
+        {
+            fail_next_hostif_vlan_tag_set = false;
+            return SAI_STATUS_INSUFFICIENT_RESOURCES;
+        }
+        const auto status = pold_sai_hostif_api->set_hostif_attribute(hif_id, attr);
+        if (attr->id == SAI_HOSTIF_ATTR_VLAN_TAG && status == SAI_STATUS_SUCCESS)
+        {
+            if (attr->value.s32 == SAI_HOSTIF_VLAN_TAG_KEEP)
+            {
+                ++hostif_keep_tag_count;
+            }
+            else if (attr->value.s32 == SAI_HOSTIF_VLAN_TAG_STRIP)
+            {
+                ++hostif_strip_tag_count;
+            }
+        }
+        return status;
     }
 
     sai_status_t _ut_set_router_interface_attribute(
@@ -87,8 +132,17 @@ namespace intfsorch_test
             sai_router_intfs_api->create_router_interface = _ut_create_router_interface;
             sai_router_intfs_api->remove_router_interface = _ut_remove_router_interface;
             sai_router_intfs_api->set_router_interface_attribute = _ut_set_router_interface_attribute;
+            pold_sai_hostif_api = sai_hostif_api;
+            ut_sai_hostif_api = *sai_hostif_api;
+            sai_hostif_api = &ut_sai_hostif_api;
+            sai_hostif_api->set_hostif_attribute = _ut_set_hostif_attribute;
+            hostif_keep_tag_count = 0;
+            hostif_strip_tag_count = 0;
+            fail_next_hostif_vlan_tag_set = false;
             saw_loopback_action = false;
             fail_next_rif_set = false;
+            fail_next_rif_create = false;
+            fail_next_rif_remove = false;
             loopback_action_set_count = 0;
             last_loopback_action = SAI_PACKET_ACTION_FORWARD;
 
@@ -208,6 +262,7 @@ namespace intfsorch_test
                 APP_TUNNEL_DECAP_TERM_TABLE_NAME
             };
             auto* tunnel_decap_orch = new TunnelDecapOrch(m_app_db.get(), m_state_db.get(), m_config_db.get(), tunnel_tables);
+            gTunneldecapOrch = tunnel_decap_orch;
             vector<string> mux_tables = {
                 CFG_MUX_CABLE_TABLE_NAME,
                 CFG_PEER_SWITCH_TABLE_NAME
@@ -315,6 +370,9 @@ namespace intfsorch_test
             delete gRouteOrch;
             gRouteOrch = nullptr;
 
+            delete gTunneldecapOrch;
+            gTunneldecapOrch = nullptr;
+
             delete gNhgOrch;
             gNhgOrch = nullptr;
 
@@ -328,9 +386,491 @@ namespace intfsorch_test
             gFlowCounterRouteOrch = nullptr;
 
             sai_router_intfs_api = pold_sai_rif_api;
+            sai_hostif_api = pold_sai_hostif_api;
             ut_helper::uninitSaiApi();
         }
     };
+
+
+
+    static std::string ownerEpoch(swss::Table &status)
+    {
+        std::string epoch;
+        EXPECT_TRUE(status.hget("__owner__", "epoch", epoch));
+        return epoch;
+    }
+
+    static void openRehomeRequest(swss::Table &status, const std::string &alias,
+                                  const std::string &id, const std::string &target)
+    {
+        status.set(alias, {{"manager_id", id}, {"manager_target", target}, {"outcome", "pending"}});
+    }
+
+    static KeyOpFieldsValuesTuple rehomeRow(const std::string &alias, const std::string &id,
+                                            const std::string &phase, const std::string &vrf,
+                                            const std::string &target, const std::string &epoch)
+    {
+        return KeyOpFieldsValuesTuple(alias, SET_COMMAND,
+            {{"vrf_name", vrf}, {"rehome_id", id}, {"rehome_phase", phase},
+             {"rehome_target", target}, {"rehome_epoch", epoch}});
+    }
+
+    struct RehomeOwnerTest : IntfsOrchTest
+    {
+        Consumer *interfaces = nullptr;
+        std::unique_ptr<swss::Table> status;
+        std::string epoch;
+
+        void SetUp() override
+        {
+            IntfsOrchTest::SetUp();
+            auto vrfs = dynamic_cast<Consumer *>(gVrfOrch->getExecutor(APP_VRF_TABLE_NAME));
+            ASSERT_NE(vrfs, nullptr);
+            vrfs->addToSync(KeyOpFieldsValuesTuple("VrfBlue", SET_COMMAND, {{"empty", "empty"}}));
+            vrfs->addToSync(KeyOpFieldsValuesTuple("VrfRed", SET_COMMAND, {{"empty", "empty"}}));
+            static_cast<Orch *>(gVrfOrch)->doTask();
+            ASSERT_TRUE(gVrfOrch->isVRFexists("VrfBlue"));
+            ASSERT_TRUE(gVrfOrch->isVRFexists("VrfRed"));
+            interfaces = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+            ASSERT_NE(interfaces, nullptr);
+            status = std::make_unique<swss::Table>(m_state_db.get(), "INTERFACE_REHOME_TABLE");
+            epoch = ownerEpoch(*status);
+            for (const auto &alias : {"Ethernet0", "Ethernet0.10"})
+            {
+                status->del(alias);
+            }
+        }
+
+        sai_object_id_t admitMoveToVrfRed(const std::string &alias)
+        {
+            interfaces->addToSync(KeyOpFieldsValuesTuple(alias, SET_COMMAND, {{"vrf_name", ""}}));
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+            const auto oldRif = gIntfsOrch->getRouterIntfsId(alias);
+            EXPECT_NE(oldRif, SAI_NULL_OBJECT_ID);
+            openRehomeRequest(*status, alias, "req-1", "VrfRed");
+            interfaces->addToSync(rehomeRow(alias, "req-1", "prepare", "", "VrfRed", epoch));
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+            EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress(alias));
+            EXPECT_EQ(gIntfsOrch->getRouterIntfsId(alias), oldRif);
+            return oldRif;
+        }
+
+        void applyAndRelease(const std::string &alias)
+        {
+            interfaces->addToSync(rehomeRow(alias, "req-1", "apply", "VrfRed", "VrfRed", epoch));
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+            interfaces->addToSync(rehomeRow(alias, "req-1", "release", "VrfRed", "VrfRed", epoch));
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        }
+    };
+
+    TEST_F(RehomeOwnerTest, AdmissionReportsReadinessAndAppliesTheTargetRif)
+    {
+        const auto oldRif = admitMoveToVrfRed("Ethernet0");
+        ASSERT_FALSE(HasFatalFailure());
+        std::string ownerPhase, refCount;
+        ASSERT_TRUE(status->hget("Ethernet0", "owner_phase", ownerPhase));
+        ASSERT_TRUE(status->hget("Ethernet0", "ref_count", refCount));
+        EXPECT_EQ(ownerPhase, "ready");
+        EXPECT_EQ(refCount, "0");
+        EXPECT_FALSE(interfaces->m_toSync.empty());
+
+        applyAndRelease("Ethernet0");
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        const auto newRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(newRif, SAI_NULL_OBJECT_ID);
+        EXPECT_NE(newRif, oldRif);
+        sai_attribute_t attr{};
+        attr.id = SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID;
+        ASSERT_EQ(sai_router_intfs_api->get_router_interface_attribute(newRif, 1, &attr), SAI_STATUS_SUCCESS);
+        EXPECT_EQ(attr.value.oid, gVrfOrch->getVRFid("VrfRed"));
+        EXPECT_NE(sai_router_intfs_api->get_router_interface_attribute(oldRif, 1, &attr), SAI_STATUS_SUCCESS);
+        ASSERT_TRUE(status->hget("Ethernet0", "owner_phase", ownerPhase));
+        EXPECT_EQ(ownerPhase, "released");
+    }
+
+    TEST_F(RehomeOwnerTest, UnarbitratedVrfFieldNeverReplacesTheAppliedRif)
+    {
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND, {{"vrf_name", "VrfBlue"}}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        const auto blueRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(blueRif, SAI_NULL_OBJECT_ID);
+
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND,
+            {{"vrf_name", "VrfRed"}, {"mac_addr", "02:03:04:05:06:07"},
+             {"rehome_id", ""}, {"rehome_phase", ""}, {"rehome_target", ""}, {"rehome_epoch", ""}}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), blueRif);
+        EXPECT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").vrf_id, gVrfOrch->getVRFid("VrfBlue"));
+    }
+
+    TEST_F(RehomeOwnerTest, CommandFromAPreviousOwnerEpochIsNotActedOn)
+    {
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND, {{"vrf_name", ""}}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        const auto rif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(rif, SAI_NULL_OBJECT_ID);
+
+        openRehomeRequest(*status, "Ethernet0", "req-1", "VrfRed");
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "prepare", "", "VrfRed",
+                                        "a-previous-owner"));
+        for (unsigned int pass = 0; pass < 3; ++pass)
+        {
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        }
+        EXPECT_FALSE(interfaces->m_toSync.empty());
+        EXPECT_EQ(gIntfsOrch->m_rehomeAdmissions.count("Ethernet0"), 0u);
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        std::string ownerId;
+        EXPECT_FALSE(status->hget("Ethernet0", "owner_id", ownerId));
+
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "prepare", "", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_EQ(gIntfsOrch->m_rehomeAdmissions.count("Ethernet0"), 1u);
+        ASSERT_TRUE(status->hget("Ethernet0", "owner_id", ownerId));
+        EXPECT_EQ(ownerId, "req-1");
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), rif);
+    }
+
+    TEST_F(RehomeOwnerTest, RecoveryRestoresTheOldVrfWithTheLatestAddresses)
+    {
+        Table appIntfs(m_app_db.get(), APP_INTF_TABLE_NAME);
+        appIntfs.set("Ethernet0", {{"vrf_name", "VrfBlue"}});
+        appIntfs.set("Ethernet0:10.0.0.1/24", {{"family", "IPv4"}});
+        gIntfsOrch->addExistingData(&appIntfs);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        const auto oldVrf = gVrfOrch->getVRFid("VrfBlue");
+        const auto oldRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(oldRif, SAI_NULL_OBJECT_ID);
+        ASSERT_TRUE(interfaces->m_toSync.empty());
+
+        openRehomeRequest(*status, "Ethernet0", "req-1", "VrfRed");
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "prepare", "VrfBlue", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "apply", "VrfRed", "VrfRed", epoch));
+        fail_next_rif_create = true;
+        ASSERT_NO_THROW(static_cast<Orch *>(gIntfsOrch)->doTask());
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().count("Ethernet0"), 0u);
+        ASSERT_FALSE(interfaces->m_toSync.empty());
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        appIntfs.del("Ethernet0:10.0.0.1/24");
+        appIntfs.set("Ethernet0:10.1.0.1/24", {{"family", "IPv4"}});
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-2", "recover", "VrfBlue", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        std::string ownerPhase;
+        ASSERT_TRUE(status->hget("Ethernet0", "owner_phase", ownerPhase));
+        EXPECT_EQ(ownerPhase, "fenced");
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), SAI_NULL_OBJECT_ID);
+
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-2", "restore", "VrfBlue", "VrfRed", epoch));
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0:10.0.0.1/24", DEL_COMMAND, {}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        ASSERT_TRUE(status->hget("Ethernet0", "owner_phase", ownerPhase));
+        EXPECT_EQ(ownerPhase, "restored");
+
+        const auto restoredRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(restoredRif, SAI_NULL_OBJECT_ID);
+        EXPECT_NE(restoredRif, oldRif);
+        const auto &applied = gIntfsOrch->getSyncdIntfses().at("Ethernet0");
+        EXPECT_EQ(applied.vrf_id, oldVrf);
+        EXPECT_EQ(applied.ip_addresses.count(IpPrefix("10.0.0.1/24")), 0u);
+        EXPECT_EQ(applied.ip_addresses.count(IpPrefix("10.1.0.1/24")), 1u);
+        sai_attribute_t attr{};
+        attr.id = SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID;
+        ASSERT_EQ(sai_router_intfs_api->get_router_interface_attribute(restoredRif, 1, &attr), SAI_STATUS_SUCCESS);
+        EXPECT_EQ(attr.value.oid, oldVrf);
+
+        sai_route_entry_t route{};
+        route.switch_id = gSwitchId;
+        route.vr_id = oldVrf;
+        attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+        copy(route.destination, IpPrefix("10.0.0.1/32"));
+        EXPECT_NE(sai_route_api->get_route_entry_attribute(&route, 1, &attr), SAI_STATUS_SUCCESS);
+        copy(route.destination, IpPrefix("10.1.0.1/32"));
+        EXPECT_EQ(sai_route_api->get_route_entry_attribute(&route, 1, &attr), SAI_STATUS_SUCCESS);
+    }
+
+    TEST_F(RehomeOwnerTest, BusyRemovalKeepsTheOldRifAndItsBookkeeping)
+    {
+        const auto oldRif = admitMoveToVrfRed("Ethernet0");
+        ASSERT_FALSE(HasFatalFailure());
+        const auto pendingCounters = gIntfsOrch->m_rifsToAdd.size();
+        ASSERT_GT(pendingCounters, 0u);
+
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "apply", "VrfRed", "VrfRed", epoch));
+        fail_next_rif_remove = true;
+        ASSERT_NO_THROW(static_cast<Orch *>(gIntfsOrch)->doTask());
+        ASSERT_FALSE(interfaces->m_toSync.empty());
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), oldRif);
+        EXPECT_EQ(gIntfsOrch->m_rifsToAdd.size(), pendingCounters);
+        EXPECT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").vrf_id, gVirtualRouterId);
+
+        NextHopGroupMember member(NextHopKey(IpAddress("0.0.0.0"), "Ethernet0"));
+        EXPECT_EQ(member.getNhId(), SAI_NULL_OBJECT_ID);
+        const auto id = sai_serialize_object_id(oldRif);
+        if (gIntfsOrch->m_vidToRidTable)
+        {
+            gIntfsOrch->m_vidToRidTable->hset("", id, id);
+        }
+        gIntfsOrch->doTask(*gIntfsOrch->m_updateMapsTimer);
+        std::string mappedRif;
+        ASSERT_TRUE(gIntfsOrch->m_rifNameTable->hget("", "Ethernet0", mappedRif));
+        EXPECT_EQ(mappedRif, id);
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "release", "VrfRed", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        EXPECT_NE(gIntfsOrch->getRouterIntfsId("Ethernet0"), oldRif);
+        EXPECT_EQ(gIntfsOrch->getSyncdIntfses().at("Ethernet0").vrf_id, gVrfOrch->getVRFid("VrfRed"));
+        EXPECT_EQ(member.getNhId(), gIntfsOrch->getRouterIntfsId("Ethernet0"));
+    }
+
+    TEST_F(RehomeOwnerTest, ReferencedRifIsNeverRemovedAndWithdrawalUnblocksTheMove)
+    {
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND, {{"vrf_name", ""}}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        const auto oldRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(oldRif, SAI_NULL_OBJECT_ID);
+
+        auto routes = dynamic_cast<ConsumerBase *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        ASSERT_NE(routes, nullptr);
+        routes->addToSync(KeyOpFieldsValuesTuple("VrfBlue:10.20.0.0/24", SET_COMMAND,
+            {{"ifname", "Ethernet0"}, {"nexthop", "0.0.0.0"}}));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_TRUE(routes->m_toSync.empty());
+        sai_route_entry_t route{};
+        route.switch_id = gSwitchId;
+        route.vr_id = gVrfOrch->getVRFid("VrfBlue");
+        copy(route.destination, IpPrefix("10.20.0.0/24"));
+        sai_attribute_t attr{};
+        attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+        ASSERT_EQ(sai_route_api->get_route_entry_attribute(&route, 1, &attr), SAI_STATUS_SUCCESS);
+        ASSERT_EQ(attr.value.oid, oldRif);
+
+        openRehomeRequest(*status, "Ethernet0", "req-1", "VrfRed");
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "prepare", "", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        std::string ownerPhase, refCount;
+        ASSERT_TRUE(status->hget("Ethernet0", "owner_phase", ownerPhase));
+        ASSERT_TRUE(status->hget("Ethernet0", "ref_count", refCount));
+        EXPECT_EQ(ownerPhase, "waiting");
+        EXPECT_EQ(refCount, "1");
+
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "apply", "VrfRed", "VrfRed", epoch));
+        for (unsigned int pass = 0; pass < 3; ++pass)
+        {
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        }
+        EXPECT_FALSE(interfaces->m_toSync.empty());
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), oldRif);
+        ASSERT_EQ(sai_route_api->get_route_entry_attribute(&route, 1, &attr), SAI_STATUS_SUCCESS);
+        EXPECT_EQ(attr.value.oid, oldRif);
+
+        routes->addToSync(KeyOpFieldsValuesTuple("VrfBlue:10.20.0.0/24", DEL_COMMAND, {}));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_NE(sai_route_api->get_route_entry_attribute(&route, 1, &attr), SAI_STATUS_SUCCESS);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "release", "VrfRed", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        const auto newRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(newRif, oldRif);
+        routes->addToSync(KeyOpFieldsValuesTuple("VrfBlue:10.20.0.0/24", SET_COMMAND,
+            {{"ifname", "Ethernet0"}, {"nexthop", "0.0.0.0"}}));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        attr.id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID;
+        ASSERT_EQ(sai_route_api->get_route_entry_attribute(&route, 1, &attr), SAI_STATUS_SUCCESS);
+        EXPECT_EQ(attr.value.oid, newRif);
+    }
+
+    TEST_F(RehomeOwnerTest, AdmissionDefersLabelRouteAcquisitionButNotWithdrawal)
+    {
+        const auto oldRif = admitMoveToVrfRed("Ethernet0");
+        ASSERT_FALSE(HasFatalFailure());
+
+        auto labels = dynamic_cast<ConsumerBase *>(gRouteOrch->getExecutor(APP_LABEL_ROUTE_TABLE_NAME));
+        ASSERT_NE(labels, nullptr);
+        labels->addToSync(KeyOpFieldsValuesTuple("100", SET_COMMAND,
+            {{"nexthop", "0.0.0.0"}, {"ifname", "Ethernet0"}, {"mpls_pop", "1"}}));
+        labels->addToSync(KeyOpFieldsValuesTuple("200", SET_COMMAND,
+            {{"nexthop", "0.0.0.0"}, {"ifname", "Ethernet0"}, {"mpls_pop", "1"}}));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        EXPECT_EQ(labels->m_toSync.count("100"), 1u);
+        EXPECT_EQ(labels->m_toSync.count("200"), 1u);
+        sai_inseg_entry_t inseg{};
+        inseg.switch_id = gSwitchId;
+        inseg.label = 100;
+        sai_attribute_t attr{};
+        attr.id = SAI_INSEG_ENTRY_ATTR_NEXT_HOP_ID;
+        EXPECT_NE(sai_mpls_api->get_inseg_entry_attribute(&inseg, 1, &attr), SAI_STATUS_SUCCESS);
+
+        labels->addToSync(KeyOpFieldsValuesTuple("200", DEL_COMMAND, {}));
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        EXPECT_EQ(labels->m_toSync.count("200"), 0u);
+
+        applyAndRelease("Ethernet0");
+        const auto newRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(newRif, oldRif);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        EXPECT_TRUE(labels->m_toSync.empty());
+        ASSERT_EQ(sai_mpls_api->get_inseg_entry_attribute(&inseg, 1, &attr), SAI_STATUS_SUCCESS);
+        EXPECT_EQ(attr.value.oid, newRif);
+        inseg.label = 200;
+        EXPECT_NE(sai_mpls_api->get_inseg_entry_attribute(&inseg, 1, &attr), SAI_STATUS_SUCCESS);
+    }
+
+    TEST_F(RehomeOwnerTest, AdmissionDefersFineGrainedRifFallback)
+    {
+        auto groups = dynamic_cast<Consumer *>(gFgNhgOrch->getExecutor(CFG_FG_NHG));
+        ASSERT_NE(groups, nullptr);
+        groups->addToSync(KeyOpFieldsValuesTuple("fg-rehome", SET_COMMAND,
+            {{"bucket_size", "4"}, {"match_mode", "prefix-based"}, {"max_next_hops", "1"}}));
+        static_cast<Orch *>(gFgNhgOrch)->doTask();
+        auto prefixes = dynamic_cast<Consumer *>(gFgNhgOrch->getExecutor(CFG_FG_NHG_PREFIX));
+        ASSERT_NE(prefixes, nullptr);
+        prefixes->addToSync(KeyOpFieldsValuesTuple("198.51.100.0/24", SET_COMMAND, {{"FG_NHG", "fg-rehome"}}));
+        static_cast<Orch *>(gFgNhgOrch)->doTask();
+        ASSERT_TRUE(prefixes->m_toSync.empty());
+
+        const auto oldRif = admitMoveToVrfRed("Ethernet0");
+        ASSERT_FALSE(HasFatalFailure());
+
+        NextHopGroupKey nextHops;
+        nextHops.add(NextHopKey(IpAddress("10.0.0.2"), "Ethernet0"));
+        const IpPrefix prefix("198.51.100.0/24");
+        sai_object_id_t nextHop = SAI_NULL_OBJECT_ID;
+        bool changed = false;
+        ASSERT_FALSE(gFgNhgOrch->setFgNhg(gVirtualRouterId, prefix, nextHops, nextHop, changed));
+        EXPECT_FALSE(gFgNhgOrch->syncdContainsFgNhg(gVirtualRouterId, prefix));
+
+        applyAndRelease("Ethernet0");
+        const auto newRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(newRif, oldRif);
+        ASSERT_TRUE(gFgNhgOrch->setFgNhg(gVirtualRouterId, prefix, nextHops, nextHop, changed));
+        EXPECT_TRUE(changed);
+        EXPECT_EQ(nextHop, newRif);
+        EXPECT_TRUE(gFgNhgOrch->syncdContainsFgNhg(gVirtualRouterId, prefix));
+    }
+
+    TEST_F(RehomeOwnerTest, DeletionSupersedesTheRequestAndRetiresItsBookkeeping)
+    {
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND, {{"vrf_name", "VrfBlue"}}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_NE(gIntfsOrch->getRouterIntfsId("Ethernet0"), SAI_NULL_OBJECT_ID);
+
+        openRehomeRequest(*status, "Ethernet0", "req-1", "VrfRed");
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "prepare", "VrfBlue", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-1", "apply", "VrfRed", "VrfRed", epoch));
+        fail_next_rif_create = true;
+        ASSERT_NO_THROW(static_cast<Orch *>(gIntfsOrch)->doTask());
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().count("Ethernet0"), 0u);
+        ASSERT_EQ(gIntfsOrch->m_rehomeIntfses.count("Ethernet0"), 1u);
+
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", DEL_COMMAND, {}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        EXPECT_EQ(gIntfsOrch->m_rehomeAdmissions.count("Ethernet0"), 0u);
+        EXPECT_EQ(gIntfsOrch->m_rehomeIntfses.count("Ethernet0"), 0u);
+        EXPECT_EQ(gIntfsOrch->m_removingIntfses.count("Ethernet0"), 0u);
+        Port port;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", port));
+        EXPECT_EQ(gPortsOrch->m_port_ref_count["Ethernet0"], 0u);
+        std::string value;
+        EXPECT_TRUE(status->hget("Ethernet0", "manager_id", value));
+        EXPECT_TRUE(status->hget("Ethernet0", "owner_id", value));
+
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND, {{"vrf_name", "VrfBlue"}}));
+        fail_next_rif_create = true;
+        EXPECT_THROW(gIntfsOrch->doTask(*interfaces), std::runtime_error);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_NE(gIntfsOrch->getRouterIntfsId("Ethernet0"), SAI_NULL_OBJECT_ID);
+
+        openRehomeRequest(*status, "Ethernet0", "req-2", "VrfRed");
+        interfaces->addToSync(rehomeRow("Ethernet0", "req-2", "prepare", "VrfBlue", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_EQ(gIntfsOrch->m_rehomeAdmissions.count("Ethernet0"), 1u);
+        ASSERT_TRUE(status->hget("Ethernet0", "owner_id", value));
+        const auto blueRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        status->del("Ethernet0");
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND,
+            {{"vrf_name", "VrfBlue"}, {"rehome_id", ""}, {"rehome_phase", ""},
+             {"rehome_target", ""}, {"rehome_epoch", ""}}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        EXPECT_EQ(gIntfsOrch->m_rehomeAdmissions.count("Ethernet0"), 0u);
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), blueRif);
+        EXPECT_FALSE(status->hget("Ethernet0", "owner_id", value));
+    }
+
+    struct SubPortRehomeTest : RehomeOwnerTest
+    {
+        uint32_t parentRefBefore = 0;
+
+        void SetUp() override
+        {
+            RehomeOwnerTest::SetUp();
+            parentRefBefore = gPortsOrch->m_port_ref_count["Ethernet0"];
+        }
+    };
+
+    TEST_F(SubPortRehomeTest, RootDeleteReclaimsTheSubPortAFailedTargetRetained)
+    {
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0.10", SET_COMMAND,
+            {{"vlan", "10"}, {"admin_status", "up"}, {"vrf_name", ""}}));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(interfaces->m_toSync.empty());
+        Port subPort;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0.10", subPort));
+        ASSERT_EQ(subPort.m_type, Port::SUBPORT);
+        ASSERT_NE(gIntfsOrch->getRouterIntfsId("Ethernet0.10"), SAI_NULL_OBJECT_ID);
+        ASSERT_EQ(hostif_keep_tag_count, 1);
+
+        openRehomeRequest(*status, "Ethernet0.10", "req-1", "VrfRed");
+        interfaces->addToSync(rehomeRow("Ethernet0.10", "req-1", "prepare", "", "VrfRed", epoch));
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_EQ(gIntfsOrch->m_rehomeAdmissions.count("Ethernet0.10"), 1u);
+
+        interfaces->addToSync(rehomeRow("Ethernet0.10", "req-1", "apply", "VrfRed", "VrfRed", epoch));
+        fail_next_rif_create = true;
+        ASSERT_NO_THROW(static_cast<Orch *>(gIntfsOrch)->doTask());
+        ASSERT_EQ(gIntfsOrch->getSyncdIntfses().count("Ethernet0.10"), 0u);
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0.10", subPort));
+        Port parentDuring;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", parentDuring));
+        ASSERT_EQ(parentDuring.m_child_ports.count("Ethernet0.10"), 1u);
+        ASSERT_GT(gPortsOrch->m_port_ref_count["Ethernet0"], parentRefBefore);
+
+        interfaces->addToSync(KeyOpFieldsValuesTuple("Ethernet0.10", DEL_COMMAND, {}));
+        fail_next_hostif_vlan_tag_set = true;
+        ASSERT_NO_THROW(static_cast<Orch *>(gIntfsOrch)->doTask());
+        EXPECT_FALSE(interfaces->m_toSync.empty());
+        EXPECT_EQ(hostif_strip_tag_count, 0);
+        EXPECT_TRUE(gPortsOrch->getPort("Ethernet0.10", subPort));
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", parentDuring));
+        EXPECT_EQ(parentDuring.m_child_ports.count("Ethernet0.10"), 1u);
+
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_TRUE(interfaces->m_toSync.empty());
+        Port removed;
+        EXPECT_FALSE(gPortsOrch->getPort("Ethernet0.10", removed));
+        EXPECT_EQ(gPortsOrch->m_portList.count("Ethernet0.10"), 0u);
+        Port parentAfter;
+        ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", parentAfter));
+        EXPECT_EQ(parentAfter.m_child_ports.count("Ethernet0.10"), 0u);
+        EXPECT_EQ(gPortsOrch->m_port_ref_count["Ethernet0"], parentRefBefore);
+        EXPECT_EQ(hostif_strip_tag_count, 1);
+        EXPECT_EQ(gIntfsOrch->m_rehomeAdmissions.count("Ethernet0.10"), 0u);
+    }
 
     TEST_F(IntfsOrchTest, IntfsOrchDeleteCreateRetry)
     {

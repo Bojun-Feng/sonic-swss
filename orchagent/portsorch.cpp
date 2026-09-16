@@ -2199,6 +2199,20 @@ bool PortsOrch::removeSubPort(const string &alias)
         SWSS_LOG_WARN("Sub interface %s: parent Port object not found", alias.c_str());
     }
 
+    // Program the parent tag before dropping the last sub port so failure is retryable.
+    const bool lastChild = parentPort.m_child_ports.count(alias) ?
+                           parentPort.m_child_ports.size() == 1 :
+                           parentPort.m_child_ports.empty();
+    if (lastChild && parentPort.m_bridge_port_id == SAI_NULL_OBJECT_ID)
+    {
+        if (!setHostIntfsStripTag(parentPort, SAI_HOSTIF_VLAN_TAG_STRIP))
+        {
+            SWSS_LOG_ERROR("Failed to set %s for hostif of port %s",
+                    hostif_vlan_tag[SAI_HOSTIF_VLAN_TAG_STRIP], parentPort.m_alias.c_str());
+            return false;
+        }
+    }
+
     if (!parentPort.m_child_ports.erase(alias))
     {
         SWSS_LOG_WARN("Sub interface %s not associated to parent port %s", alias.c_str(), parentPort.m_alias.c_str());
@@ -2210,20 +2224,6 @@ bool PortsOrch::removeSubPort(const string &alias)
     m_portList[parentPort.m_alias] = parentPort;
 
     m_portList.erase(it);
-
-    // Restore hostif vlan tag for the parent port when the last subport is removed
-    if (parentPort.m_child_ports.empty())
-    {
-        if (parentPort.m_bridge_port_id == SAI_NULL_OBJECT_ID)
-        {
-            if (!setHostIntfsStripTag(parentPort, SAI_HOSTIF_VLAN_TAG_STRIP))
-            {
-                SWSS_LOG_ERROR("Failed to set %s for hostif of port %s",
-                        hostif_vlan_tag[SAI_HOSTIF_VLAN_TAG_STRIP], parentPort.m_alias.c_str());
-                return false;
-            }
-        }
-    }
 
     return true;
 }

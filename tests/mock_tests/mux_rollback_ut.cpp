@@ -203,6 +203,66 @@ namespace mux_rollback_test
         }
     };
 
+    TEST_F(MuxRollbackTest, AdmissionDefersActivationUntilRelease)
+    {
+        const NeighborEntry neighbor(IpAddress(SERVER_IP1), VLAN_1000);
+        const NextHopKey nh(IpAddress(SERVER_IP1), VLAN_1000);
+        const auto rif = gIntfsOrch->getRouterIntfsId(VLAN_1000);
+        const auto tunnel = m_MuxCable->getNextHopId(nh);
+        const auto acl = m_MuxCable->acl_handler_.get();
+        ASSERT_NE(rif, SAI_NULL_OBJECT_ID);
+        ASSERT_NE(tunnel, SAI_NULL_OBJECT_ID);
+        ASSERT_FALSE(gNeighOrch->isHwConfigured(neighbor));
+        Table tunnels(m_app_db.get(), APP_TUNNEL_ROUTE_TABLE_NAME);
+        vector<string> before, after;
+        tunnels.getKeys(before);
+        ASSERT_FALSE(before.empty());
+
+        auto interfaces = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        auto activation = dynamic_cast<Consumer *>(m_MuxCableOrch->getExecutor(APP_MUX_CABLE_TABLE_NAME));
+        auto send = [&](const string &phase) {
+            interfaces->addToSync({VLAN_1000, SET_COMMAND,
+                {{"vrf_name", ""}, {"rehome_id", "req-1"}, {"rehome_phase", phase},
+                 {"rehome_target", "VrfNew"}, {"rehome_epoch", gIntfsOrch->m_rehomeEpoch}}});
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        };
+
+        send("prepare");
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress(VLAN_1000));
+        EXPECT_CALL(*mock_sai_route_api, remove_route_entries).Times(0);
+        EXPECT_CALL(*mock_sai_acl_api, remove_acl_entry).Times(0);
+        SetMuxStateFromAppDb(ACTIVE_STATE);
+        EXPECT_EQ(m_MuxCable->getState(), STANDBY_STATE);
+        EXPECT_EQ(m_MuxCable->getNextHopId(nh), tunnel);
+        EXPECT_EQ(m_MuxCable->acl_handler_.get(), acl);
+        EXPECT_FALSE(gNeighOrch->isHwConfigured(neighbor));
+        EXPECT_EQ(gNeighOrch->m_syncdNextHops.count(nh), 0u);
+        EXPECT_EQ(activation->m_toSync.count(TEST_INTERFACE), 1u);
+        tunnels.getKeys(after);
+        EXPECT_EQ(after, before);
+        ::testing::Mock::VerifyAndClearExpectations(mock_sai_route_api);
+        ::testing::Mock::VerifyAndClearExpectations(mock_sai_acl_api);
+
+        send("recover");
+        send("restore");
+        send("release");
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress(VLAN_1000));
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId(VLAN_1000), rif);
+        Table neighbors(m_app_db.get(), APP_NEIGH_TABLE_NAME);
+        neighbors.set(VLAN_1000 + ":" + SERVER_IP1,
+            {{"neigh", "62:f9:65:10:2f:04"}, {"family", "IPv4"}});
+        gNeighOrch->addExistingData(&neighbors);
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        static_cast<Orch *>(m_MuxCableOrch)->doTask();
+        EXPECT_TRUE(activation->m_toSync.empty());
+        EXPECT_EQ(m_MuxCable->getState(), ACTIVE_STATE);
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(neighbor));
+        EXPECT_NE(gNeighOrch->getLocalNextHopId(neighbor), SAI_NULL_OBJECT_ID);
+        EXPECT_EQ(m_MuxCable->getNextHopId(nh), gNeighOrch->getLocalNextHopId(neighbor));
+        tunnels.getKeys(after);
+        EXPECT_TRUE(after.empty());
+    }
+
     TEST_F(MuxRollbackTest, StandbyToActiveNeighborAlreadyExists)
     {
         if (!IsPrefixBasedMuxNeighbor())

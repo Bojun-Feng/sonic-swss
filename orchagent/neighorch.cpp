@@ -350,6 +350,11 @@ bool NeighOrch::addNextHop(NeighborContext& ctx)
     SWSS_LOG_ENTER();
     const NextHopKey nh = ctx.neighborEntry;
 
+    if (m_intfsOrch->isIntfChangeInProgress(nh.alias))
+    {
+        return false;
+    }
+
     Port p;
     if (!gPortsOrch->getPort(nh.alias, p))
     {
@@ -380,6 +385,10 @@ bool NeighOrch::addNextHop(NeighborContext& ctx)
 
     assert(!hasNextHop(nexthop));
     sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(nh.alias);
+    if (rif_id == SAI_NULL_OBJECT_ID)
+    {
+        return false;
+    }
 
     vector<sai_attribute_t> next_hop_attrs;
 
@@ -1323,6 +1332,12 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
     IpAddress ip_address = neighborEntry.ip_address;
     string alias = neighborEntry.alias;
     bool bulk_op = ctx.bulk_op;
+
+    // Defer acquisitions, not withdrawals needed to release the old RIF.
+    if (m_intfsOrch->isIntfChangeInProgress(alias))
+    {
+        return false;
+    }
 
     sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(alias);
     if (rif_id == SAI_NULL_OBJECT_ID)

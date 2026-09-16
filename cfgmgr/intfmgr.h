@@ -8,6 +8,7 @@
 #include <map>
 #include <string>
 #include <set>
+#include <chrono>
 
 struct SubIntfInfo
 {
@@ -34,6 +35,30 @@ private:
     Table m_statePortTable, m_stateLagTable, m_stateVlanTable, m_stateVrfTable, m_stateIntfTable, m_appLagTable;
 
     Table m_neighTable;
+    Table m_rehomeStateTable;
+    Table m_appIntfTable;
+    DBConnector *m_cfgDb;
+    struct RehomeRequest
+    {
+        std::string id, oldVrf, target, phase, ownerEpoch, recoveryVrf, appliedVrf;
+        std::chrono::steady_clock::time_point deadline;
+        std::chrono::steady_clock::time_point phaseStarted;
+        bool quiesced = false;
+        bool cancelling = false;
+    };
+    std::map<std::string, RehomeRequest> m_rehomeRequests;
+    uint64_t m_rehomeSequence = 0;
+    bool processRehome(const std::string &alias, std::string &target);
+    void sendRehome(const std::string &alias, const RehomeRequest &request,
+                    const std::string &phase, const std::string &vrf);
+    bool resumeRehomeInterface(const std::string &alias);
+    bool quiesceRehomeInterface(const std::string &alias);
+    void beginRehomeRecovery(const std::string &alias, RehomeRequest &request, const std::string &epoch);
+    void setRehomePhase(const std::string &alias, RehomeRequest &request, const std::string &phase, int budget);
+    std::string interfaceConfigTable(const std::string &alias) const;
+    void reconcileRehomeAddresses(const std::string &alias);
+    bool rehomeControlsCleared(const std::string &alias, const std::string &binding);
+    bool holdSagPublication(const std::string &alias, std::vector<FieldValueTuple> &fields);
 
     SubIntfMap m_subIntfList;
     SagIntfMap m_sagIntfList;
@@ -44,14 +69,14 @@ private:
     std::string mySwitchType;
 
     void setIntfIp(const std::string &alias, const std::string &opCmd, const IpPrefix &ipPrefix);
-    void setIntfVrf(const std::string &alias, const std::string &vrfName);
+    bool setIntfVrf(const std::string &alias, const std::string &vrfName);
     void setIntfMac(const std::string &alias, const std::string &macAddr);
     bool setIntfMpls(const std::string &alias, const std::string &mpls);
     void setIntfState(const std::string &alias, bool isUp);
     void setSagFdbEntry(const std::string &op, const std::string &alias, const std::string &mac_str);
 
     bool doIntfGeneralTask(const std::vector<std::string>& keys, std::vector<FieldValueTuple> data, const std::string& op);
-    bool doIntfAddrTask(const std::vector<std::string>& keys, const std::vector<FieldValueTuple>& data, const std::string& op);
+    bool doIntfAddrTask(const std::vector<std::string>& keys, const std::vector<FieldValueTuple>& data, const std::string& op, bool replace = false);
     void doSagTask(const std::vector<std::string>& keys, const std::vector<FieldValueTuple>& data, const std::string& op);
     void doTask(Consumer &consumer);
     void doPortTableTask(const std::string& key, std::vector<FieldValueTuple> data, std::string op);

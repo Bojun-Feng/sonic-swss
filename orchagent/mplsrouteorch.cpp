@@ -461,6 +461,15 @@ bool RouteOrch::addLabelRoute(LabelRouteBulkContext& ctx, const NextHopGroupKey 
 {
     SWSS_LOG_ENTER();
 
+    if (ctx.nhg_index.empty() && nextHops.getSize() == 1)
+    {
+        const auto &nexthop = *nextHops.getNextHops().begin();
+        if (nexthop.isIntfNextHop() && m_intfsOrch->isIntfChangeInProgress(nexthop.alias))
+        {
+            return false;
+        }
+    }
+
     sai_object_id_t& vrf_id = ctx.vrf_id;
     Label& label = ctx.label;
 

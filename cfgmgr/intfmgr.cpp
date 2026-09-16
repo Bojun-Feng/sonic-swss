@@ -45,7 +45,10 @@ IntfMgr::IntfMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
         m_appIntfTableProducer(appDb, APP_INTF_TABLE_NAME),
         m_appSagTableProducer(appDb, APP_SAG_TABLE_NAME),
         m_neighTable(appDb, APP_NEIGH_TABLE_NAME),
-        m_appLagTable(appDb, APP_LAG_TABLE_NAME)
+        m_appLagTable(appDb, APP_LAG_TABLE_NAME),
+        m_rehomeStateTable(stateDb, "INTERFACE_REHOME_TABLE"),
+        m_appIntfTable(appDb, APP_INTF_TABLE_NAME),
+        m_cfgDb(cfgDb)
 {
     auto subscriberStateTable = new swss::SubscriberStateTable(stateDb,
             STATE_PORT_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, 100);
@@ -56,6 +59,9 @@ IntfMgr::IntfMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
             STATE_LAG_TABLE_NAME, TableConsumable::DEFAULT_POP_BATCH_SIZE, 200);
     auto stateLagConsumer = new Consumer(subscriberStateLagTable, this, STATE_LAG_TABLE_NAME);
     Orch::addExecutor(stateLagConsumer);
+
+    auto feedback = new SubscriberStateTable(stateDb, "INTERFACE_REHOME_TABLE");
+    Orch::addExecutor(new Consumer(feedback, this, "INTERFACE_REHOME_TABLE"));
 
     if (!WarmStart::isWarmStart())
     {
@@ -119,7 +125,7 @@ void IntfMgr::setIntfIp(const string &alias, const string &opCmd,
     int ret = swss::exec(cmd.str(), res);
     if (ret)
     {
-        if (!ipPrefix.isV4() && opCmd == "add")
+        if (!ipPrefix.isV4() && (opCmd == "add" || opCmd == "replace"))
         {
             SWSS_LOG_NOTICE("Failed to assign IPv6 on interface %s with return code %d, trying to enable IPv6 and retry", alias.c_str(), ret);
             if (!enableIpv6Flag(alias))
@@ -193,7 +199,7 @@ void IntfMgr::setIntfMac(const string &alias, const string &mac_str)
     }
 }
 
-void IntfMgr::setIntfVrf(const string &alias, const string &vrfName)
+bool IntfMgr::setIntfVrf(const string &alias, const string &vrfName)
 {
     stringstream cmd;
     string res;
@@ -211,6 +217,7 @@ void IntfMgr::setIntfVrf(const string &alias, const string &vrfName)
     {
         SWSS_LOG_ERROR("Command '%s' failed with rc %d", cmd.str().c_str(), ret);
     }
+    return ret == 0;
 }
 
 bool IntfMgr::setIntfMpls(const string &alias, const string& mpls)
@@ -371,6 +378,297 @@ bool IntfMgr::isIntfCreated(const string &alias)
     }
 
     return false;
+}
+
+void IntfMgr::sendRehome(const string &alias, const RehomeRequest &request,
+                         const string &phase, const string &vrf)
+{
+    m_appIntfTableProducer.set(alias, {{"vrf_name", vrf}, {"rehome_id", request.id},
+        {"rehome_phase", phase}, {"rehome_target", request.target}, {"rehome_epoch", request.ownerEpoch}});
+}
+
+string IntfMgr::interfaceConfigTable(const string &alias) const
+{
+    if (alias.find('.') != string::npos)
+        return CFG_VLAN_SUB_INTF_TABLE_NAME;
+    if (alias.compare(0, strlen(LAG_PREFIX), LAG_PREFIX) == 0)
+        return CFG_LAG_INTF_TABLE_NAME;
+    if (alias.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX) == 0)
+        return CFG_VLAN_INTF_TABLE_NAME;
+    return CFG_INTF_TABLE_NAME;
+}
+
+void IntfMgr::setRehomePhase(const string &alias, RehomeRequest &request, const string &phase, int budget)
+{
+    request.phase = phase;
+    request.phaseStarted = std::chrono::steady_clock::now();
+    request.deadline = request.phaseStarted + std::chrono::seconds(budget);
+    m_rehomeStateTable.set(alias, {{"manager_phase", phase}, {"phase_budget_seconds", to_string(budget)}});
+}
+
+void IntfMgr::beginRehomeRecovery(const string &alias, RehomeRequest &request, const string &epoch)
+{
+    request.id = to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + to_string(++m_rehomeSequence);
+    request.ownerEpoch = epoch;
+    request.cancelling = true;
+    request.recoveryVrf = request.oldVrf;
+    m_rehomeStateTable.hget(alias, "manager_recovery_vrf", request.recoveryVrf);
+    m_rehomeStateTable.set(alias, {{"manager_id", request.id}, {"manager_old_vrf", request.oldVrf},
+        {"manager_target", request.target}, {"manager_owner_epoch", epoch},
+        {"outcome", "recovering"}});
+    setRehomePhase(alias, request, "recover", 0);
+    // A restart can interrupt after the link resumes but before admission is released.
+    if (request.quiesced)
+        quiesceRehomeInterface(alias);
+    sendRehome(alias, request, "recover", request.recoveryVrf);
+}
+
+bool IntfMgr::quiesceRehomeInterface(const string &alias)
+{
+    string output;
+    return swss::exec("sysctl -w net/ipv6/conf/" + shellquote(alias) + "/keep_addr_on_down=1", output) == 0 &&
+           swss::exec(string(IP_CMD) + " link set " + shellquote(alias) + " down", output) == 0;
+}
+
+void IntfMgr::reconcileRehomeAddresses(const string &alias)
+{
+    Table config(m_cfgDb, interfaceConfigTable(alias));
+    vector<string> keys;
+    vector<FieldValueTuple> fields;
+    m_appIntfTable.getKeys(keys);
+    for (const auto &key : keys)
+    {
+        if (key.compare(0, alias.size() + 1, alias + ":") == 0 &&
+            !config.get(alias + "|" + key.substr(alias.size() + 1), fields))
+            doIntfAddrTask({alias, key.substr(alias.size() + 1)}, {}, DEL_COMMAND);
+    }
+    config.getKeys(keys);
+    for (const auto &key : keys)
+    {
+        if (key.compare(0, alias.size() + 1, alias + "|") == 0 && config.get(key, fields))
+            doIntfAddrTask({alias, key.substr(alias.size() + 1)}, fields, SET_COMMAND, true);
+    }
+}
+
+bool IntfMgr::resumeRehomeInterface(const string &alias)
+{
+    string table = CFG_PORT_TABLE_NAME;
+    string admin = "up";
+    if (alias.find('.') != string::npos)
+        table = CFG_VLAN_SUB_INTF_TABLE_NAME;
+    else if (alias.compare(0, strlen(LAG_PREFIX), LAG_PREFIX) == 0)
+        table = CFG_LAG_TABLE_NAME;
+    else if (alias.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX) == 0)
+        table = CFG_VLAN_TABLE_NAME;
+    if (table == CFG_PORT_TABLE_NAME || table == CFG_LAG_TABLE_NAME)
+        admin = "down";
+    Table config(m_cfgDb, table);
+    config.hget(alias, "admin_status", admin);
+    string output;
+    return swss::exec(string(IP_CMD) + " link set " + shellquote(alias) +
+                      (admin == "down" ? " down" : " up"), output) == 0;
+}
+
+bool IntfMgr::rehomeControlsCleared(const string &alias, const string &binding)
+{
+    // Producer writes are staged; completion requires the materialized row to be clear.
+    vector<FieldValueTuple> fields;
+    if (!m_appIntfTable.get(alias, fields))
+        return false;
+    bool acknowledged = false;
+    for (const auto &field : fields)
+    {
+        const auto &name = fvField(field);
+        if (name == "vrf_name")
+            acknowledged = fvValue(field) == binding;
+        else if ((name == "rehome_id" || name == "rehome_phase" ||
+                  name == "rehome_target" || name == "rehome_epoch") && !fvValue(field).empty())
+            return false;
+    }
+    return acknowledged;
+}
+
+bool IntfMgr::processRehome(const string &alias, string &target)
+{
+    constexpr int coordinationBudget = 10;
+    constexpr int referenceBudget = 5;
+    constexpr int targetBudget = 10;
+    string epoch;
+    m_rehomeStateTable.hget("__owner__", "epoch", epoch);
+    auto entry = m_rehomeRequests.find(alias);
+    if (entry == m_rehomeRequests.end())
+    {
+        string rejected, outcome;
+        // An empty manager_target records a cancelled request for the default VRF.
+        const bool haveRejected = m_rehomeStateTable.hget(alias, "manager_target", rejected);
+        m_rehomeStateTable.hget(alias, "outcome", outcome);
+        if (outcome == "pending" || outcome == "recovering")
+        {
+            string previousPhase;
+            m_rehomeStateTable.hget(alias, "manager_phase", previousPhase);
+            if (previousPhase == "clearing")
+            {
+                RehomeRequest resumed;
+                resumed.phase = "clearing";
+                resumed.target = rejected;
+                m_rehomeStateTable.hget(alias, "manager_id", resumed.id);
+                m_rehomeStateTable.hget(alias, "manager_owner_epoch", resumed.ownerEpoch);
+                m_rehomeStateTable.hget(alias, "manager_old_vrf", resumed.oldVrf);
+                if (!m_rehomeStateTable.hget(alias, "manager_recovery_vrf", resumed.appliedVrf))
+                    m_stateIntfTable.hget(alias, "vrf", resumed.appliedVrf);
+                m_rehomeRequests.emplace(alias, resumed);
+                return processRehome(alias, target);
+            }
+            RehomeRequest request;
+            request.quiesced = !previousPhase.empty() && previousPhase != "prepare";
+            if (!m_rehomeStateTable.hget(alias, "manager_old_vrf", request.oldVrf))
+                m_stateIntfTable.hget(alias, "vrf", request.oldVrf);
+            request.target = rejected;
+            entry = m_rehomeRequests.emplace(alias, request).first;
+            beginRehomeRecovery(alias, entry->second, epoch);
+            return false;
+        }
+        if (outcome == "cancelled" && rejected == target)
+        {
+            m_stateIntfTable.hget(alias, "vrf", target);
+            return true;
+        }
+        if (!isIntfChangeVrf(alias, target))
+        {
+            if (outcome == "cancelled" && haveRejected && rejected != target)
+            {
+                SWSS_LOG_NOTICE("VRF rehome %s cancellation of %s retired by applied request %s",
+                                alias.c_str(), rejected.c_str(), target.c_str());
+                m_rehomeStateTable.del(alias);
+            }
+            return true;
+        }
+        string oldVrf;
+        m_stateIntfTable.hget(alias, "vrf", oldVrf);
+        if (oldVrf.compare(0, strlen(VNET_PREFIX), VNET_PREFIX) == 0 ||
+            target.compare(0, strlen(VNET_PREFIX), VNET_PREFIX) == 0)
+            return true;
+        const subIntf subIf(alias);
+        if (!isIntfStateOk(subIf.isValid() ? subIf.parentIntf() : alias) ||
+            (!target.empty() && !isIntfStateOk(target)))
+            return false;
+        RehomeRequest request;
+        request.id = to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                     "-" + to_string(++m_rehomeSequence);
+        request.oldVrf = oldVrf;
+        request.target = target;
+        request.ownerEpoch = epoch;
+        entry = m_rehomeRequests.emplace(alias, request).first;
+        m_rehomeStateTable.set(alias, {{"manager_id", request.id}, {"manager_target", target},
+            {"manager_old_vrf", oldVrf}, {"manager_recovery_vrf", oldVrf},
+            {"manager_owner_epoch", epoch}, {"outcome", "pending"}});
+        setRehomePhase(alias, entry->second, "prepare", coordinationBudget);
+        sendRehome(alias, entry->second, "prepare", oldVrf);
+        return false;
+    }
+    auto &request = entry->second;
+    if (request.phase == "clearing")
+    {
+        // Do not re-quiesce an applied binding while its control cleanup is pending.
+        m_appIntfTableProducer.set(alias, {{"vrf_name", request.appliedVrf}, {"rehome_id", ""},
+            {"rehome_phase", ""}, {"rehome_target", ""}, {"rehome_epoch", ""}});
+        if (!rehomeControlsCleared(alias, request.appliedVrf))
+            return false;
+        const string appliedVrf = request.appliedVrf;
+        const bool superseded = target != request.target;
+        m_rehomeStateTable.set(alias, {{"outcome", appliedVrf == request.target ? "succeeded" : "cancelled"},
+            {"manager_phase", "done"}, {"manager_applied_vrf", appliedVrf}});
+        m_rehomeRequests.erase(entry);
+        if (superseded)
+            return processRehome(alias, target);
+        target = appliedVrf;
+        return true;
+    }
+    if (request.ownerEpoch != epoch)
+    {
+        beginRehomeRecovery(alias, request, epoch);
+        return false;
+    }
+    string ownerId, ownerPhase, ownerEpoch;
+    m_rehomeStateTable.hget(alias, "owner_id", ownerId);
+    m_rehomeStateTable.hget(alias, "owner_phase", ownerPhase);
+    m_rehomeStateTable.hget(alias, "owner_epoch", ownerEpoch);
+    if (ownerId != request.id || ownerEpoch != epoch)
+        ownerPhase.clear();
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool ready = request.phase == "drain" && ownerPhase == "ready";
+    const bool applied = request.phase == "apply" && ownerPhase == "applied";
+    if (!request.cancelling && !applied &&
+        (target != request.target || (!ready && now >= request.deadline)))
+    {
+        string references = "unknown";
+        string budget;
+        m_rehomeStateTable.hget(alias, "phase_budget_seconds", budget);
+        m_rehomeStateTable.hget(alias, "ref_count", references);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - request.phaseStarted).count();
+        SWSS_LOG_WARN("VRF rehome %s request %s old %s requested %s phase %s elapsed %lld ms budget %s s owner %s refs %s (unattributed); reconciling binding",
+                      alias.c_str(), request.id.c_str(), request.oldVrf.c_str(), request.target.c_str(),
+                      request.phase.c_str(), static_cast<long long>(elapsed), budget.c_str(), ownerPhase.c_str(), references.c_str());
+        beginRehomeRecovery(alias, request, epoch);
+        return false;
+    }
+    if (request.phase == "prepare" && (ownerPhase == "waiting" || ownerPhase == "ready"))
+    {
+        if (!quiesceRehomeInterface(alias))
+            return false;
+        request.quiesced = true;
+        setRehomePhase(alias, request, "drain", referenceBudget);
+    }
+    if (request.phase == "drain" && ownerPhase == "ready")
+    {
+        setRehomePhase(alias, request, "target", targetBudget);
+    }
+    if (request.phase == "target")
+    {
+        if (!isIntfStateOk(request.target.empty() ? alias : request.target) ||
+            !setIntfVrf(alias, request.target))
+            return false;
+        request.phase = "apply";
+        m_rehomeStateTable.hset(alias, "manager_phase", "apply");
+        sendRehome(alias, request, "apply", request.target);
+        return false;
+    }
+    if (request.phase == "recover" && ownerPhase == "fenced")
+    {
+        if (!quiesceRehomeInterface(alias) || !setIntfVrf(alias, request.recoveryVrf))
+            return false;
+        request.quiesced = true;
+        reconcileRehomeAddresses(alias);
+        sendRehome(alias, request, "restore", request.recoveryVrf);
+        request.phase = "restoring";
+        m_rehomeStateTable.hset(alias, "manager_phase", "restoring");
+        return false;
+    }
+    if ((request.phase == "apply" && ownerPhase == "applied") ||
+        (request.phase == "restoring" && ownerPhase == "restored"))
+    {
+        reconcileRehomeAddresses(alias);
+        if (request.quiesced && !resumeRehomeInterface(alias))
+            return false;
+        // Recovery retains this RIF after acquisition reopens to new references.
+        const string binding = request.cancelling ? request.recoveryVrf : request.target;
+        m_rehomeStateTable.hset(alias, "manager_recovery_vrf", binding);
+        setRehomePhase(alias, request, "release", coordinationBudget);
+        sendRehome(alias, request, "release", binding);
+        return false;
+    }
+    if (request.phase != "release" || ownerPhase != "released")
+        return false;
+
+    request.appliedVrf = request.cancelling ? request.recoveryVrf : request.target;
+    m_stateIntfTable.hset(alias, "vrf", request.appliedVrf);
+    if (request.appliedVrf != request.target)
+        SWSS_LOG_WARN("VRF rehome %s request %s cancelled; requested %s not applied, restored %s",
+                      alias.c_str(), request.id.c_str(), request.target.c_str(), request.appliedVrf.c_str());
+    request.phase = "clearing";
+    m_rehomeStateTable.hset(alias, "manager_phase", "clearing");
+    return processRehome(alias, target);
 }
 
 bool IntfMgr::isIntfChangeVrf(const string &alias, const string &vrfName)
@@ -903,6 +1201,18 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
 
     if (op == SET_COMMAND)
     {
+        string oldVrf;
+        m_stateIntfTable.hget(alias, "vrf", oldVrf);
+        if (m_rehomeRequests.count(alias) ||
+            (!is_lo && oldVrf.compare(0, strlen(VNET_PREFIX), VNET_PREFIX) != 0 &&
+             vrf_name.compare(0, strlen(VNET_PREFIX), VNET_PREFIX) != 0))
+        {
+            if (!processRehome(alias, vrf_name))
+                return false;
+            for (auto &field : data)
+                if (fvField(field) == "vrf_name")
+                    fvValue(field) = vrf_name;
+        }
         if (!isIntfStateOk(parentAlias.empty() ? alias : parentAlias))
         {
             SWSS_LOG_DEBUG("Interface is not ready, skipping %s", alias.c_str());
@@ -915,10 +1225,9 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             return false;
         }
 
-        /* if to change vrf then skip */
         if (isIntfChangeVrf(alias, vrf_name))
         {
-            SWSS_LOG_ERROR("%s can not change to %s directly, skipping", alias.c_str(), vrf_name.c_str());
+            SWSS_LOG_ERROR("%s can not change VRF binding directly, skipping", alias.c_str());
             return true;
         }
 
@@ -1167,6 +1476,9 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             }
         }
 
+        // Producer writes merge, so clear stale controls explicitly.
+        for (const auto &field : {"rehome_id", "rehome_phase", "rehome_target", "rehome_epoch"})
+            data.emplace_back(field, "");
         m_appIntfTableProducer.set(alias, data);
         m_stateIntfTable.hset(alias, "vrf", vrf_name);
     }
@@ -1217,8 +1529,29 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             m_sagIntfList.erase(alias);
         }
 
+        // Restore administrative intent before forgetting a transition on DEL.
+        string outcome;
+        m_rehomeStateTable.hget(alias, "outcome", outcome);
+        if (!is_lo && parentAlias.empty() &&
+            (m_rehomeRequests.count(alias) || outcome == "pending" ||
+             outcome == "recovering"))
+        {
+            const string tableName = alias.compare(0, strlen(LAG_PREFIX), LAG_PREFIX) == 0 ?
+                CFG_LAG_TABLE_NAME : (alias.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX) == 0 ?
+                CFG_VLAN_TABLE_NAME : CFG_PORT_TABLE_NAME);
+            Table config(m_cfgDb, tableName);
+            vector<FieldValueTuple> fields;
+            if (config.get(alias, fields) && !resumeRehomeInterface(alias))
+            {
+                SWSS_LOG_ERROR("VRF rehome %s could not restore administrative state on deletion",
+                               alias.c_str());
+            }
+        }
+
         m_appIntfTableProducer.del(alias);
         m_stateIntfTable.del(alias);
+        m_rehomeRequests.erase(alias);
+        m_rehomeStateTable.del(alias);
     }
     else
     {
@@ -1230,7 +1563,7 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
 
 bool IntfMgr::doIntfAddrTask(const vector<string>& keys,
         const vector<FieldValueTuple>& data,
-        const string& op)
+        const string& op, bool replace)
 {
     SWSS_LOG_ENTER();
 
@@ -1250,7 +1583,7 @@ bool IntfMgr::doIntfAddrTask(const vector<string>& keys,
             return false;
         }
 
-        setIntfIp(alias, "add", ip_prefix);
+        setIntfIp(alias, replace ? "replace" : "add", ip_prefix);
 
         if (!ip_prefix.isV4() && ip_prefix.getIp().getAddrScope() == IpAddress::AddrScope::LINK_SCOPE)
         {
@@ -1353,6 +1686,38 @@ void IntfMgr::doTask(Consumer &consumer)
 
     string table_name = consumer.getTableName();
 
+    if (table_name == "INTERFACE_REHOME_TABLE")
+    {
+        // Replayed status can be the only notice of CONFIG deletion during downtime.
+        auto updates = std::move(consumer.m_toSync);
+        consumer.m_toSync.clear();
+        for (const auto &update : updates)
+        {
+            const string alias = kfvKey(update.second);
+            string outcome;
+            if (alias == "__owner__" ||
+                !m_rehomeStateTable.hget(alias, "outcome", outcome) ||
+                (outcome != "pending" && outcome != "recovering"))
+            {
+                continue;
+            }
+            const auto tableName = interfaceConfigTable(alias);
+            auto *requests = dynamic_cast<Consumer *>(getExecutor(tableName));
+            if (!requests)
+            {
+                continue;
+            }
+            Table config(m_cfgDb, tableName);
+            vector<FieldValueTuple> fields;
+            if (!config.get(alias, fields) && !m_rehomeRequests.count(alias))
+            {
+                requests->addToSync(KeyOpFieldsValuesTuple(alias, DEL_COMMAND, fields));
+            }
+            requests->drain();
+        }
+        return;
+    }
+
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
@@ -1366,6 +1731,16 @@ void IntfMgr::doTask(Consumer &consumer)
             vector<string> keys = tokenize(kfvKey(t), config_db_key_delimiter);
             const vector<FieldValueTuple>& data = kfvFieldsValues(t);
             string op = kfvOp(t);
+
+            if (op == SET_COMMAND && !keys.empty())
+            {
+                const auto root = consumer.m_toSync.find(keys[0]);
+                if (root != consumer.m_toSync.end() && kfvOp(root->second) == DEL_COMMAND)
+                {
+                    ++it;
+                    continue;
+                }
+            }
 
             if (keys.size() == 1)
             {
@@ -1387,7 +1762,16 @@ void IntfMgr::doTask(Consumer &consumer)
                     continue;
                 }
 
-                if (!doIntfGeneralTask(keys, data, op))
+                // Retained SETs merge in the consumer; reread the current CONFIG row.
+                vector<FieldValueTuple> current = data;
+                if (op == SET_COMMAND)
+                {
+                    Table config(m_cfgDb, table_name);
+                    vector<FieldValueTuple> latest;
+                    if (config.get(keys[0], latest))
+                        current = std::move(latest);
+                }
+                if (!doIntfGeneralTask(keys, current, op))
                 {
                     it++;
                     continue;
@@ -1454,6 +1838,40 @@ void IntfMgr::doPortTableTask(const string& key, vector<FieldValueTuple> data, s
     }
 }
 
+bool IntfMgr::holdSagPublication(const string &alias, vector<FieldValueTuple> &fields)
+{
+    // A SAG merge must not replace the binding owned by a live transition.
+    string outcome;
+    m_rehomeStateTable.hget(alias, "outcome", outcome);
+    const auto request = m_rehomeRequests.find(alias);
+    if (request == m_rehomeRequests.end() && outcome != "pending" && outcome != "recovering")
+    {
+        return false;
+    }
+    string phase;
+    bool quiesced = false;
+    if (request != m_rehomeRequests.end())
+    {
+        phase = request->second.phase;
+        quiesced = request->second.quiesced;
+    }
+    else
+    {
+        m_rehomeStateTable.hget(alias, "manager_phase", phase);
+        quiesced = !phase.empty() && phase != "prepare";
+    }
+    for (auto it = fields.begin(); it != fields.end(); ++it)
+    {
+        if (fvField(*it) == "vrf_name")
+        {
+            fields.erase(it);
+            break;
+        }
+    }
+    return phase == "drain" || phase == "target" || phase == "apply" ||
+           phase == "restoring" || (phase == "recover" && quiesced);
+}
+
 void IntfMgr::updateSagMac(const std::string &macAddr)
 {
     vector<string> keys;
@@ -1480,20 +1898,22 @@ void IntfMgr::updateSagMac(const std::string &macAddr)
             {
                 SWSS_LOG_NOTICE("set %s mac address to %s", key.c_str(), macAddr.c_str());
 
+                vector<FieldValueTuple> vlanIntFv;
+
+                // Get other fields to set them all together
+                m_cfgVlanIntfTable.get(key, vlanIntFv);
+                const bool heldDown = holdSagPublication(key, vlanIntFv);
+
                 // enable SAG, set device down and up to regenerate IPv6 LL by MAC
                 setIntfState(key, false);
                 setIntfMac(key, macAddr);
-                setIntfState(key, true);
+                if (!heldDown)
+                    setIntfState(key, true);
 
                 // remove the previous sag MAC fdb from bridge
                 setSagFdbEntry("del", key, gSagMacAddress.to_string());
                 // add this new MAC fdb into bridge, the "replace" could cover both "add" and "replace" cases.
                 setSagFdbEntry("replace", key, macAddr);
-
-                vector<FieldValueTuple> vlanIntFv;
-
-                // Get other fields to set them all together
-                m_cfgVlanIntfTable.get(key, vlanIntFv);
 
                 // keep consistent with default MAC 00:00:00:00:00:00
                 string entryMac = MacAddress().to_string();

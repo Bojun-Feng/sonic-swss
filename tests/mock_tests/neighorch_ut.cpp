@@ -189,6 +189,81 @@ namespace neighorch_test
         }
     };
 
+    TEST_F(NeighOrchTest, RehomeFenceDefersAcquisitionAndAdmitsItAfterRelease)
+    {
+        LearnNeighbor(VLAN_1000, TEST_IP, MAC1);
+        ASSERT_EQ(gNeighOrch->m_syncdNeighbors.count(VLAN1000_NEIGH), 1u);
+        const auto oldRif = gIntfsOrch->getRouterIntfsId(VLAN_1000);
+        ASSERT_NE(oldRif, SAI_NULL_OBJECT_ID);
+        const auto heldBefore = gIntfsOrch->getSyncdIntfses().at(VLAN_1000).ref_count;
+        ASSERT_GT(heldBefore, 0);
+
+        auto interfaces = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        auto neighbors = dynamic_cast<Consumer *>(gNeighOrch->getExecutor(APP_NEIGH_TABLE_NAME));
+        ASSERT_NE(interfaces, nullptr);
+        ASSERT_NE(neighbors, nullptr);
+        Table status(m_state_db.get(), "INTERFACE_REHOME_TABLE");
+        status.set(VLAN_1000, {{"manager_id", "req-1"}, {"manager_target", VRF_3000},
+                               {"outcome", "pending"}});
+        auto send = [&](const string &phase, const string &vrf) {
+            interfaces->addToSync(KeyOpFieldsValuesTuple(VLAN_1000, SET_COMMAND,
+                {{"vrf_name", vrf}, {"rehome_id", "req-1"}, {"rehome_phase", phase},
+                 {"rehome_target", VRF_3000}, {"rehome_epoch", gIntfsOrch->m_rehomeEpoch}}));
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        };
+
+        send("prepare", "");
+        string phase, refCount;
+        ASSERT_TRUE(status.hget(VLAN_1000, "owner_phase", phase));
+        ASSERT_TRUE(status.hget(VLAN_1000, "ref_count", refCount));
+        EXPECT_EQ(phase, "waiting");
+        EXPECT_EQ(refCount, std::to_string(heldBefore));
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress(VLAN_1000));
+        EXPECT_EQ(gIntfsOrch->getRouterIntfsId(VLAN_1000), oldRif);
+
+        const string queuedIp = "10.10.10.11";
+        const NeighborEntry queued(queuedIp, VLAN_1000);
+        neighbors->addToSync(KeyOpFieldsValuesTuple(VLAN_1000 + ":" + queuedIp, SET_COMMAND,
+            {{"neigh", MAC1}, {"family", "IPv4"}}));
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_FALSE(neighbors->m_toSync.empty());
+        EXPECT_EQ(gNeighOrch->m_syncdNeighbors.count(queued), 0u);
+        NeighborContext nextHop(NeighborEntry("10.10.10.12", VLAN_1000));
+        EXPECT_FALSE(gNeighOrch->addNextHop(nextHop));
+        EXPECT_FALSE(gNeighOrch->hasNextHop(nextHop.neighborEntry));
+
+        neighbors->addToSync(KeyOpFieldsValuesTuple(VLAN_1000 + ":" + TEST_IP, DEL_COMMAND, {}));
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_EQ(gNeighOrch->m_syncdNeighbors.count(VLAN1000_NEIGH), 0u);
+        EXPECT_EQ(gIntfsOrch->getSyncdIntfses().at(VLAN_1000).ref_count, 0);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(status.hget(VLAN_1000, "owner_phase", phase));
+        EXPECT_EQ(phase, "ready");
+
+        send("apply", VRF_3000);
+        ASSERT_TRUE(status.hget(VLAN_1000, "owner_phase", phase));
+        EXPECT_EQ(phase, "applied");
+        const auto newRif = gIntfsOrch->getRouterIntfsId(VLAN_1000);
+        ASSERT_NE(newRif, SAI_NULL_OBJECT_ID);
+        EXPECT_NE(newRif, oldRif);
+        EXPECT_EQ(gIntfsOrch->getSyncdIntfses().at(VLAN_1000).vrf_id, gVrfOrch->getVRFid(VRF_3000));
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress(VLAN_1000));
+        neighbors->addToSync(KeyOpFieldsValuesTuple(VLAN_1000 + ":" + queuedIp, SET_COMMAND,
+            {{"neigh", MAC3}, {"family", "IPv4"}}));
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_EQ(gNeighOrch->m_syncdNeighbors.count(queued), 0u);
+
+        send("release", VRF_3000);
+        ASSERT_TRUE(status.hget(VLAN_1000, "owner_phase", phase));
+        EXPECT_EQ(phase, "released");
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress(VLAN_1000));
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_TRUE(neighbors->m_toSync.empty());
+        ASSERT_EQ(gNeighOrch->m_syncdNeighbors.count(queued), 1u);
+        EXPECT_EQ(gNeighOrch->m_syncdNeighbors.at(queued).mac, MacAddress(MAC3));
+        EXPECT_GT(gIntfsOrch->getSyncdIntfses().at(VLAN_1000).ref_count, 0);
+    }
+
     TEST_F(NeighOrchTest, MultiVlanDuplicateNeighbor)
     {
         EXPECT_CALL(*mock_sai_neighbor_api, create_neighbor_entry);
