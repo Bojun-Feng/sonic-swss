@@ -486,16 +486,47 @@ namespace intfmgr_ut
         afterRestart.m_rehomeStateTable.set("Ethernet0", {{"outcome", "pending"},
             {"manager_phase", "drain"}, {"manager_id", "before-restart"},
             {"manager_target", "VrfRed"}, {"manager_old_vrf", ""}});
+        swss::Table appIntfs(m_app_db.get(), APP_INTF_TABLE_NAME);
+        appIntfs.set("Ethernet0:192.0.2.1/24", {{"family", "IPv4"}, {"scope", "global"}});
+        static int kernelAddresses;
+        kernelAddresses = 1;
+        callback = [](const std::string &cmd, std::string &output) {
+            if (cmd.find("/sbin/ip address show ") == 0)
+            {
+                output = std::to_string(kernelAddresses) + "\n";
+                return 0;
+            }
+            if (cmd.find("address \"del\"") != std::string::npos && kernelAddresses > 0)
+            {
+                --kernelAddresses;
+            }
+            return cb(cmd, output);
+        };
         mockCallArgs.clear();
         auto *replay = dynamic_cast<Consumer *>(afterRestart.getExecutor("INTERFACE_REHOME_TABLE"));
         ASSERT_NE(replay, nullptr);
         replay->addToSync(swss::KeyOpFieldsValuesTuple("__owner__", SET_COMMAND, {}));
         replay->addToSync(swss::KeyOpFieldsValuesTuple("Ethernet0", SET_COMMAND, {}));
         afterRestart.doTask(*replay);
+
+        EXPECT_TRUE(commandWasIssued("address \"del\" \"192.0.2.1/24\""));
+        EXPECT_EQ(kernelAddresses, 0);
+        std::vector<swss::FieldValueTuple> published;
+        EXPECT_FALSE(appIntfs.get("Ethernet0:192.0.2.1/24", published));
         EXPECT_TRUE(commandWasIssued("\"Ethernet0\" up"));
         std::string value;
         EXPECT_FALSE(afterRestart.m_rehomeStateTable.hget("Ethernet0", "outcome", value));
         EXPECT_FALSE(afterRestart.m_stateIntfTable.hget("Ethernet0", "vrf", value));
+
+        auto *afterRequests = dynamic_cast<Consumer *>(afterRestart.getExecutor(CFG_INTF_TABLE_NAME));
+        ASSERT_NE(afterRequests, nullptr);
+        EXPECT_EQ(afterRequests->m_toSync.count("Ethernet0"), 0u);
+        afterRestart.m_cfgIntfTable.set("Ethernet0", {{"NULL", "NULL"}});
+        afterRequests->addToSync({"Ethernet0", SET_COMMAND, {{"NULL", "NULL"}}});
+        afterRestart.doTask(*afterRequests);
+        EXPECT_TRUE(afterRequests->m_toSync.empty());
+        EXPECT_TRUE(afterRestart.m_stateIntfTable.hget("Ethernet0", "vrf", value));
+        callback = cb;
     }
 
     TEST_F(IntfMgrTest, KernelFailureInsideTheTargetPhaseIsRetriedThenCancelled)

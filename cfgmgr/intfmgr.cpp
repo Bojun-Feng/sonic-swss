@@ -1711,6 +1711,8 @@ void IntfMgr::doTask(Consumer &consumer)
             vector<FieldValueTuple> fields;
             if (!config.get(alias, fields) && !m_rehomeRequests.count(alias))
             {
+                // Withdraw only IntfMgr-published addresses before synthesizing DEL.
+                reconcileRehomeAddresses(alias);
                 requests->addToSync(KeyOpFieldsValuesTuple(alias, DEL_COMMAND, fields));
             }
             requests->drain();
