@@ -1,6 +1,7 @@
 #include "gtest/gtest.h"
 #include <iostream>
 #include <fstream>
+#include <string>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "../mock_table.h"
@@ -17,6 +18,12 @@ extern swss::MacAddress gSagMacAddress;
 
 bool Ethernet0IPv6Set = false;
 bool FailBridgeFdbCommand = false;
+int LinkLocalFlushResult = 0;
+int LinkLocalShowResult = 0;
+std::string LinkLocalReadback;
+int Ipv4LinkLocalFlushResult = 0;
+int Ipv4LinkLocalShowResult = 0;
+std::string Ipv4LinkLocalReadback;
 
 int cb(const std::string &cmd, std::string &stdout){
     mockCallArgs.push_back(cmd);
@@ -33,6 +40,23 @@ int cb(const std::string &cmd, std::string &stdout){
     }
     else if (cmd.find("bridge fdb") == 0) {
         return FailBridgeFdbCommand ? 1 : 0;
+    }
+    else if (cmd.find("/sbin/ip neigh del dev ") == 0) {
+        return cmd.find("169.254.") != std::string::npos ? Ipv4LinkLocalFlushResult : LinkLocalFlushResult;
+    }
+    else if (cmd.find("/sbin/ip -6 neigh flush") == 0) {
+        return LinkLocalFlushResult;
+    }
+    else if (cmd.find("/sbin/ip -6 neigh show") == 0) {
+        stdout = LinkLocalReadback;
+        return LinkLocalShowResult;
+    }
+    else if (cmd.find("/sbin/ip -4 neigh flush") == 0) {
+        return Ipv4LinkLocalFlushResult;
+    }
+    else if (cmd.find("/sbin/ip -4 neigh show") == 0) {
+        stdout = Ipv4LinkLocalReadback;
+        return Ipv4LinkLocalShowResult;
     }
     else {
         return 0;
@@ -71,6 +95,12 @@ namespace intfmgr_ut
             mockCallArgs.clear();
             callback = cb;
             FailBridgeFdbCommand = false;
+            LinkLocalFlushResult = 0;
+            LinkLocalShowResult = 0;
+            LinkLocalReadback.clear();
+            Ipv4LinkLocalFlushResult = 0;
+            Ipv4LinkLocalShowResult = 0;
+            Ipv4LinkLocalReadback.clear();
         }
     };
 
@@ -99,6 +129,125 @@ namespace intfmgr_ut
             }
         }
         return false;
+    }
+
+    TEST_F(IntfMgrTest, CleanupFailureRetainsRootAndMode)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        intfmgr.m_stateIntfTable.set("Ethernet0", {{"vrf", ""}});
+        intfmgr.m_neighTable.set("Ethernet0:fe80::2", {{"neigh", "00:11:22:33:44:55"}});
+        LinkLocalFlushResult = 2;
+
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        EXPECT_EQ(1u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0"));
+        std::vector<swss::FieldValueTuple> fields;
+        EXPECT_TRUE(intfmgr.m_stateIntfTable.get("Ethernet0", fields));
+        EXPECT_FALSE(commandWasIssued("-6 neigh show"));
+    }
+
+    TEST_F(IntfMgrTest, KernelOnlyResidueCannotCompleteRemoval)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        intfmgr.m_stateIntfTable.set("Ethernet0", {{"vrf", ""}});
+        LinkLocalReadback = "fe80::2 dev Ethernet0 lladdr 00:11:22:33:44:55 PERMANENT\n";
+
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        EXPECT_EQ(1u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0"));
+        std::vector<swss::FieldValueTuple> fields;
+        EXPECT_TRUE(intfmgr.m_stateIntfTable.get("Ethernet0", fields));
+    }
+
+    TEST_F(IntfMgrTest, FailedReadbackIsNotEmptyInventory)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        LinkLocalShowResult = 2;
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        EXPECT_EQ(1u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0"));
+    }
+
+    TEST_F(IntfMgrTest, SuccessfulRetryDischargesOnlyCheckedCleanup)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        intfmgr.m_stateIntfTable.set("Ethernet0", {{"vrf", ""}});
+        LinkLocalFlushResult = 2;
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        LinkLocalFlushResult = 0;
+        LinkLocalReadback = " \t\r\n";
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        EXPECT_EQ(0u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0"));
+        std::vector<swss::FieldValueTuple> fields;
+        EXPECT_FALSE(intfmgr.m_stateIntfTable.get("Ethernet0", fields));
+    }
+
+    TEST_F(IntfMgrTest, CleanupTargetsExactDeviceAndIpv6LinkLocalScope)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        intfmgr.m_neighTable.set("Ethernet00:fe80::2", {{"neigh", "00:11:22:33:44:55"}});
+        mockCallArgs.clear();
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        std::vector<std::string> cleanupCommands;
+        for (const auto &command : mockCallArgs)
+        {
+            if (command.find(" neigh ") != std::string::npos)
+            {
+                cleanupCommands.push_back(command);
+            }
+        }
+        const std::vector<std::string> expected = {
+            "/sbin/ip -6 neigh flush dev \"Ethernet0\" to fe80::/10 nud all",
+            "/sbin/ip -6 neigh show dev \"Ethernet0\" to fe80::/10 nud all",
+            "/sbin/ip -4 neigh flush dev \"Ethernet0\" to 169.254.0.0/16 nud all",
+            "/sbin/ip -4 neigh show dev \"Ethernet0\" to 169.254.0.0/16 nud all"
+        };
+        EXPECT_EQ(expected, cleanupCommands);
+        EXPECT_FALSE(commandWasIssued("Ethernet00"));
+    }
+
+    TEST_F(IntfMgrTest, Ipv4UnnumberedNeighborCleanupFailureRemainsPending)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        intfmgr.m_neighTable.set("Ethernet0:169.254.0.1", {{"neigh", "00:11:22:33:44:55"}});
+        Ipv4LinkLocalFlushResult = 2;
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        EXPECT_EQ(1u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0"));
+    }
+
+    TEST_F(IntfMgrTest, KernelOnlyIpv4LinkLocalResidueIsNotIgnored)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        Ipv4LinkLocalReadback = "169.254.0.1 dev Ethernet0 lladdr 00:11:22:33:44:55 PERMANENT\n";
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {}, DEL_COMMAND));
+        EXPECT_EQ(1u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0"));
+    }
+
+    TEST_F(IntfMgrTest, ModeDisableRetainsExistingLiveUpdateBehavior)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_statePortTable.set("Ethernet0", {{"state", "ok"}});
+        intfmgr.m_stateIntfTable.set("Ethernet0", {{"vrf", ""}});
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0");
+        LinkLocalReadback = "fe80::2 dev Ethernet0 lladdr 00:11:22:33:44:55 REACHABLE\n";
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet0"}, {{"ipv6_use_link_local_only", "disable"}}, SET_COMMAND));
+        EXPECT_EQ(0u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0"));
+        EXPECT_FALSE(commandWasIssued("neigh flush"));
+        EXPECT_FALSE(commandWasIssued("neigh show"));
+    }
+
+    TEST_F(IntfMgrTest, CleanupRunsBeforeDeletingSubinterfaceDevice)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_ipv6LinkLocalModeList.insert("Ethernet0.100");
+        LinkLocalFlushResult = 2;
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet0.100"}, {}, DEL_COMMAND));
+        EXPECT_FALSE(commandWasIssued("link del"));
+        EXPECT_EQ(1u, intfmgr.m_ipv6LinkLocalModeList.count("Ethernet0.100"));
     }
 
     TEST_F(IntfMgrTest, testSettingIpv6Flag){

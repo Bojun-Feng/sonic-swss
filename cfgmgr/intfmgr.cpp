@@ -806,6 +806,36 @@ void IntfMgr::delIpv6LinkLocalNeigh(const string &alias)
     }
 }
 
+bool IntfMgr::cleanupLinkLocalNeigh(const string &alias)
+{
+    // Removal needs a checked kernel inventory, not just APP_DB entries.
+    // Preserve IPv4 link-local neighbors used by unnumbered routing as well.
+    for (const auto &family : {make_pair("-6", "fe80::/10"),
+                               make_pair("-4", "169.254.0.0/16")})
+    {
+        const string filter = " dev " + shellquote(alias) + " to " + family.second + " nud all";
+        const string command = string(IP_CMD) + " " + family.first + " neigh ";
+        string output;
+        int rc = swss::exec(command + "flush" + filter, output);
+        if (rc)
+        {
+            SWSS_LOG_WARN("Link-local cleanup %s failed for %s, rc %d: %s",
+                          family.first, alias.c_str(), rc, output.c_str());
+            return false;
+        }
+
+        output.clear();
+        rc = swss::exec(command + "show" + filter, output);
+        if (rc || output.find_first_not_of(" \t\r\n") != string::npos)
+        {
+            SWSS_LOG_WARN("Link-local cleanup %s is not complete for %s, rc %d: %s",
+                          family.first, alias.c_str(), rc, output.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
         vector<FieldValueTuple> data,
         const string& op)
@@ -1181,6 +1211,13 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
 
         setIntfVrf(alias, "");
 
+        // Check the kernel while the device still exists. A failed command or
+        // nonempty readback must not consume the link-local cleanup obligation.
+        if (m_ipv6LinkLocalModeList.count(alias) && !cleanupLinkLocalNeigh(alias))
+        {
+            return false;
+        }
+
         if (is_lo)
         {
             delLoopbackIntf(alias);
@@ -1198,7 +1235,6 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
         if (m_ipv6LinkLocalModeList.find(alias) != m_ipv6LinkLocalModeList.end())
         {
             m_ipv6LinkLocalModeList.erase(alias);
-            delIpv6LinkLocalNeigh(alias);
             SWSS_LOG_INFO("Erased ipv6 link local mode list for %s", alias.c_str());
         }
 

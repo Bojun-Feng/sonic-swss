@@ -77,6 +77,7 @@ private:
     void setSubIntfStateOk(const std::string &alias);
     void removeSubIntfState(const std::string &alias);
     void delIpv6LinkLocalNeigh(const std::string &alias);
+    bool cleanupLinkLocalNeigh(const std::string &alias);
 
     bool setIntfProxyArp(const std::string &alias, const std::string &proxy_arp);
     bool setIntfGratArp(const std::string &alias, const std::string &grat_arp);
