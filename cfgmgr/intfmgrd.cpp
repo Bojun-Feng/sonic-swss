@@ -84,6 +84,9 @@ int main(int argc, char **argv)
 
             auto *c = (Executor *)sel;
             c->execute();
+
+            // Unrelated table events must not starve pending interface retries.
+            intfmgr.doTask();
         }
     }
     catch(const std::exception &e)

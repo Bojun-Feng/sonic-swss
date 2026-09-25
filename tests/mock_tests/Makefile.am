@@ -445,3 +445,11 @@ tests_teamsyncd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -lnl-genl-3 \
         -lswsscommon -ldl -lhiredis -lgtest -lgtest_main -lpthread -lteam -lteamdctl -lnl-route-3
 
 LOG_DRIVER = $(top_srcdir)/run-gtest-suite.py
+
+EXTRA_DIST = intfmgrd/dispatcher/run.py \
+             intfmgrd/dispatcher/fixture.hpp \
+             intfmgrd/dispatcher/retry_test.cpp \
+             intfmgrd/dispatcher/README.md
+
+check-local:
+	CXX="$(CXX)" python3 $(srcdir)/intfmgrd/dispatcher/run.py --out $(builddir)/dispatcher-regression
