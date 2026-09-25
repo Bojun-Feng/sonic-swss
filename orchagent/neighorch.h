@@ -108,6 +108,7 @@ public:
     bool disableNeighbor(const NeighborEntry&);
     bool enableNeighbors(std::list<NeighborContext>&);
     bool disableNeighbors(std::list<NeighborContext>&);
+    bool retireInterfaceNeighbors(const string &alias);
     bool isHwConfigured(const NeighborEntry&);
     void processFDBDelete(const FdbEntry &entry);
     void processFDBAdd(const FdbEntry &entry);
@@ -149,6 +150,7 @@ private:
     ProducerStateTable m_appNeighResolveProducer;
 
     NeighborTable m_syncdNeighbors;
+    std::map<NeighborEntry, std::vector<FieldValueTuple>> m_desiredNeighbors;
     NextHopTable m_syncdNextHops;
 
     /* Registrant count per IPinIP tunnel NextHopKey (e.g. MuxOrch, TunnelDecapOrch) */

@@ -284,6 +284,21 @@ namespace neighorch_test
         }
     };
 
+    TEST_F(NeighOrchTest, LegacyRemovalDoesNotFreezeNeighborProgramming)
+    {
+        NeighborData data;
+        data.mac = MacAddress(MAC1);
+        data.hw_configured = false;
+        gNeighOrch->m_syncdNeighbors[VLAN1000_NEIGH] = data;
+        gIntfsOrch->m_removingIntfses.insert(VLAN_1000);
+
+        std::list<NeighborContext> requests;
+        requests.emplace_back(VLAN1000_NEIGH, true);
+        EXPECT_TRUE(gNeighOrch->enableNeighbors(requests));
+        EXPECT_TRUE(gNeighOrch->isHwConfigured(VLAN1000_NEIGH));
+        gIntfsOrch->m_removingIntfses.erase(VLAN_1000);
+    }
+
     TEST_F(NeighOrchTest, SystemNeighFromDifferentAsicOnSameHost)
     {
         VoqGlobalsGuard guard;

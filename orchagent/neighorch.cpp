@@ -360,6 +360,11 @@ bool NeighOrch::addNextHop(NeighborContext& ctx)
     SWSS_LOG_ENTER();
     const NextHopKey nh = ctx.neighborEntry;
 
+    if (m_intfsOrch->isIntfBindingGuarded(nh.alias))
+    {
+        return false;
+    }
+
     Port p;
     if (!gPortsOrch->getPort(nh.alias, p))
     {
@@ -1007,6 +1012,45 @@ bool NeighOrch::getNeighborEntry(const IpAddress &ipAddress, string vrf_name, Ne
     return getNeighborEntry(nexthop, neighborEntry, macAddress);
 }
 
+bool NeighOrch::retireInterfaceNeighbors(const string &alias)
+{
+    // Admission is held by IntfsOrch. Keep newer desired SETs in the normal
+    // consumer queue while removing old hardware neighbors through their owner.
+    // This also preserves withdrawal when a DEL was coalesced with relearning.
+    vector<NeighborEntry> oldNeighbors;
+    for (const auto &neighbor : m_syncdNeighbors)
+    {
+        if (neighbor.first.alias == alias)
+        {
+            oldNeighbors.push_back(neighbor.first);
+        }
+    }
+    bool complete = true;
+    for (const auto &neighbor : oldNeighbors)
+    {
+        NeighborContext ctx(neighbor);
+        if (!removeNeighbor(ctx))
+        {
+            complete = false;
+        }
+        else
+        {
+            auto desired = m_desiredNeighbors.find(neighbor);
+            auto consumer = dynamic_cast<Consumer *>(getExecutor(APP_NEIGH_TABLE_NAME));
+            const auto key = alias + ":" + neighbor.ip_address.to_string();
+            if (consumer && desired != m_desiredNeighbors.end() && !consumer->m_toSync.count(key))
+            {
+                // A desired SET may have been consumed before admission. Do
+                // not lose it with the old hardware cache, or overwrite a
+                // newer SET/DEL already waiting in the normal consumer.
+                const KeyOpFieldsValuesTuple replay{key, SET_COMMAND, desired->second};
+                consumer->addToSync(replay);
+            }
+        }
+    }
+    return complete;
+}
+
 void NeighOrch::doTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -1040,6 +1084,22 @@ void NeighOrch::doTask(Consumer &consumer)
         }
 
         string alias = key.substr(0, found);
+
+        const NeighborEntry desiredNeighbor{IpAddress(key.substr(found + 1)), alias};
+        if (op == SET_COMMAND)
+        {
+            m_desiredNeighbors[desiredNeighbor] = kfvFieldsValues(t);
+        }
+        else if (op == DEL_COMMAND)
+        {
+            m_desiredNeighbors.erase(desiredNeighbor);
+        }
+
+        if (op == SET_COMMAND && m_intfsOrch->isIntfBindingGuarded(alias))
+        {
+            ++it;
+            continue;
+        }
 
         if (alias == "eth0" || alias == "lo" || alias == "docker0" || alias == "usb0"
             || ((op == SET_COMMAND) && m_intfsOrch->isInbandIntfInMgmtVrf(alias)))
@@ -1333,6 +1393,11 @@ bool NeighOrch::addNeighbor(NeighborContext& ctx)
     IpAddress ip_address = neighborEntry.ip_address;
     string alias = neighborEntry.alias;
     bool bulk_op = ctx.bulk_op;
+
+    if (m_intfsOrch->isIntfBindingGuarded(alias))
+    {
+        return false;
+    }
 
     sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(alias);
     if (rif_id == SAI_NULL_OBJECT_ID)

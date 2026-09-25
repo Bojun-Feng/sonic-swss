@@ -157,6 +157,10 @@ namespace intfsorch_test
 
             ASSERT_EQ(gPortsOrch, nullptr);
             gPortsOrch = new PortsOrch(m_app_db.get(), m_state_db.get(), ports_tables, m_chassis_app_db.get());
+            // NeighOrch::addNeighbor resolves PortsOrch through gDirectory (as
+            // orchdaemon and MockOrchTest register it); without this the lookup
+            // returns nullptr and getAllVlans() dereferences a null PortsOrch.
+            gDirectory.set(gPortsOrch);
 
             vector<string> vnet_tables = {
                 APP_VNET_RT_TABLE_NAME,
@@ -575,5 +579,178 @@ namespace intfsorch_test
         Port port;
         ASSERT_TRUE(gPortsOrch->getPort("Ethernet0", port));
         ASSERT_EQ(port.m_nat_zone_id, 7u);
+    }
+
+    class BindingGuardTest : public IntfsOrchTest
+    {
+    protected:
+        void SetUp() override
+        {
+            testing_db::reset();
+            IntfsOrchTest::SetUp();
+        }
+
+        void send(Orch *orch, const string &table, const KeyOpFieldsValuesTuple &entry)
+        {
+            auto consumer = dynamic_cast<Consumer *>(orch->getConsumerBase(table));
+            ASSERT_NE(consumer, nullptr);
+            std::deque<KeyOpFieldsValuesTuple> entries{entry};
+            consumer->addToSync(entries);
+            orch->doTask();
+        }
+
+        void request(const string &id, const string &action, bool current = true)
+        {
+            if (current)
+            {
+                Table state(m_state_db.get(), STATE_INTF_GUARD_TABLE_NAME);
+                state.set("Ethernet0", {{"request_id", id}, {"action", action}, {"target_vrf", "VrfBlue"}});
+                if (action == "applied") state.set("Ethernet0", {{"applied_id", id}});
+            }
+            send(gIntfsOrch, APP_INTF_GUARD_TABLE_NAME,
+                 {"Ethernet0", SET_COMMAND, {{"id", id}, {"action", action}}});
+        }
+
+        void defaultRoot()
+        {
+            send(gIntfsOrch, APP_INTF_TABLE_NAME, {"Ethernet0", SET_COMMAND, {{"mtu", "9100"}}});
+            ASSERT_NE(gIntfsOrch->getRouterIntfsId("Ethernet0"), SAI_NULL_OBJECT_ID);
+        }
+
+        void newRoot()
+        {
+            send(gVrfOrch, APP_VRF_TABLE_NAME, {"VrfBlue", SET_COMMAND, {{"NULL", "NULL"}}});
+            ASSERT_TRUE(gVrfOrch->isVRFexists("VrfBlue"));
+            send(gIntfsOrch, APP_INTF_TABLE_NAME,
+                 {"Ethernet0", SET_COMMAND, {{"vrf_name", "VrfBlue"}, {"mtu", "9100"}}});
+        }
+
+        void neighbor(const string &mac)
+        {
+            send(gNeighOrch, APP_NEIGH_TABLE_NAME,
+                 {"Ethernet0:192.0.2.2", SET_COMMAND, {{"neigh", mac}, {"family", "IPv4"}}});
+        }
+
+        void checkNeighbor(const string &mac)
+        {
+            NextHopKey key(IpAddress("192.0.2.2"), "Ethernet0");
+            ASSERT_TRUE(gNeighOrch->hasNextHop(key));
+            NeighborEntry entry;
+            MacAddress actual;
+            ASSERT_TRUE(gNeighOrch->getNeighborEntry(key, entry, actual));
+            EXPECT_EQ(actual, MacAddress(mac));
+            sai_attribute_t attr;
+            attr.id = SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID;
+            ASSERT_EQ(SAI_STATUS_SUCCESS, sai_next_hop_api->get_next_hop_attribute(
+                gNeighOrch->getNextHopId(key), 1, &attr));
+            EXPECT_EQ(attr.value.oid, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+        }
+    };
+
+    TEST_F(BindingGuardTest, PreparationAcknowledgesAdmissionWithoutWaitingForOldReferences)
+    {
+        defaultRoot();
+        const auto oldRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+        request("1", "prepare");
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        EXPECT_EQ(oldRif, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+        Table state(m_state_db.get(), STATE_INTF_GUARD_TABLE_NAME);
+        string acknowledged, status;
+        ASSERT_TRUE(state.hget("Ethernet0", "id", acknowledged));
+        ASSERT_TRUE(state.hget("Ethernet0", "state", status));
+        EXPECT_EQ("1", acknowledged);
+        EXPECT_EQ("guarded", status);
+        request("1", "applied");
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        gIntfsOrch->decreaseRouterIntfsRefCount("Ethernet0");
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+    }
+
+    TEST_F(BindingGuardTest, CanceledSuccessorRetainsEarlierAppliedRetirement)
+    {
+        defaultRoot();
+        auto oldRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+        request("1", "prepare");
+        request("1", "applied");
+        request("2", "prepare");
+        request("2", "cancel");
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        EXPECT_EQ(oldRif, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+        gIntfsOrch->decreaseRouterIntfsRefCount("Ethernet0");
+        static_cast<Orch*>(gIntfsOrch)->doTask();
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        EXPECT_EQ(SAI_NULL_OBJECT_ID, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+    }
+
+    TEST_F(BindingGuardTest, AppliedRequestRetiresRootEvenWhenInterfaceDeleteWasCoalesced)
+    {
+        defaultRoot();
+        const auto oldRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        request("1", "prepare");
+        newRoot();
+        EXPECT_EQ(oldRif, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+        request("1", "applied");
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        EXPECT_NE(oldRif, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+        EXPECT_EQ(gVrfOrch->getVRFid("VrfBlue"), gIntfsOrch->getSyncdIntfses().at("Ethernet0").vrf_id);
+    }
+
+    TEST_F(BindingGuardTest, ConsumedDesiredNeighborIsReplayedOnNewRif)
+    {
+        defaultRoot();
+        neighbor("02:00:00:00:00:01");
+        neighbor("02:00:00:00:00:02"); // Already consumed before prepare.
+        checkNeighbor("02:00:00:00:00:02");
+        const auto oldRif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        request("1", "prepare");
+        newRoot();
+        request("1", "applied");
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_NE(oldRif, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+        checkNeighbor("02:00:00:00:00:02");
+    }
+
+    TEST_F(BindingGuardTest, PendingNewNeighborTakesPrecedenceOverReplay)
+    {
+        defaultRoot();
+        neighbor("02:00:00:00:00:01");
+        request("1", "prepare");
+        neighbor("02:00:00:00:00:02"); // Must remain queued while held.
+        newRoot();
+        request("1", "applied");
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        checkNeighbor("02:00:00:00:00:02");
+    }
+
+    TEST_F(BindingGuardTest, PendingDeleteDoesNotResurrectRetiredNeighbor)
+    {
+        defaultRoot();
+        neighbor("02:00:00:00:00:01");
+        request("1", "prepare");
+        auto consumer = dynamic_cast<Consumer *>(gNeighOrch->getConsumerBase(APP_NEIGH_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> deletion{{"Ethernet0:192.0.2.2", DEL_COMMAND, {}}};
+        consumer->addToSync(deletion);
+        newRoot();
+        request("1", "applied");
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        EXPECT_FALSE(gNeighOrch->hasNextHop(NextHopKey(IpAddress("192.0.2.2"), "Ethernet0")));
+    }
+
+    TEST_F(BindingGuardTest, SupersededNotificationCannotReleaseCurrentFence)
+    {
+        defaultRoot();
+        request("1", "prepare");
+        request("2", "prepare");
+        request("1", "cancel", false);
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        request("1", "applied", false);
+        EXPECT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        request("2", "cancel");
+        EXPECT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
     }
 }
