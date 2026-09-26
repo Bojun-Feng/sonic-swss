@@ -68,6 +68,17 @@ public:
      */
     virtual NextHopGroupKey getNhgKey() const = 0;
 
+    virtual std::set<std::string> getRifAliases() const
+    {
+        std::set<std::string> aliases;
+        const auto key = getNhgKey();
+        for (const auto &nh : key.getNextHops())
+        {
+            aliases.insert(nh.alias);
+        }
+        return aliases;
+    }
+
     /* Increment the number of existing groups. */
     static inline void incSyncedCount() { SWSS_LOG_ENTER(); ++m_syncdCount; }
 

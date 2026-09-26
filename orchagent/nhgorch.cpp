@@ -380,7 +380,18 @@ void NhgOrch::doTask(Consumer& consumer)
                 /* Common update, when all the requirements are met. */
                 else
                 {
-                    success = nhg_ptr->update(nhg_key);
+                    // Do not destructively update a synced group while a proposed
+                    // member is fenced. Keep both the old group and the SET for retry.
+                    bool guarded = false;
+                    for (const auto &nh : nhg_key.getNextHops())
+                    {
+                        if (gIntfsOrch->isIntfBindingGuarded(nh.alias))
+                        {
+                            guarded = true;
+                            break;
+                        }
+                    }
+                    success = !guarded && nhg_ptr->update(nhg_key);
 
                     /* Keep the msg in loop if any member path is not available yet */
                     if (is_recursive && non_existent_member)
@@ -535,6 +546,11 @@ bool NhgOrch::invalidateNextHop(const NextHopKey& nh_key)
 sai_object_id_t NextHopGroupMember::getNhId() const
 {
     SWSS_LOG_ENTER();
+
+    if (gIntfsOrch->isIntfBindingGuarded(m_key.alias))
+    {
+        return SAI_NULL_OBJECT_ID;
+    }
 
     sai_object_id_t nh_id = SAI_NULL_OBJECT_ID;
 

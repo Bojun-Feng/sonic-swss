@@ -479,6 +479,210 @@ namespace routeorch_test
         }
     };
 
+    struct NhgMoveCase
+    {
+        NextHopKey oldNh, newNh;
+        ConsumerBase *consumer = nullptr;
+        int oldRefs = 0, newRefs = 0;
+        sai_object_id_t oldId = SAI_NULL_OBJECT_ID;
+        NextHopGroupKey oldKey;
+
+        const NextHopGroup &nhg() const { return gNhgOrch->getNhg("guard-proof"); }
+
+        void seed()
+        {
+            gIntfsOrch->m_intfGuard = IntfGuard{};
+            Table neighbors(m_app_db.get(), APP_NEIGH_TABLE_NAME);
+            neighbors.set("Ethernet4:11.0.0.2", {{"neigh", "00:00:0b:00:00:02"}, {"family", "IPv4"}});
+            gNeighOrch->addExistingData(&neighbors);
+            static_cast<Orch *>(gNeighOrch)->doTask();
+            oldNh = NextHopKey("11.0.0.2@Ethernet4");
+            newNh = NextHopKey("10.0.0.2@Ethernet0");
+            ASSERT_TRUE(gNeighOrch->hasNextHop(oldNh));
+            ASSERT_TRUE(gNeighOrch->hasNextHop(newNh));
+            consumer = gNhgOrch->getConsumerBase(APP_NEXTHOP_GROUP_TABLE_NAME);
+            ASSERT_NE(nullptr, consumer);
+        }
+
+        void snapshot()
+        {
+            oldRefs = gNeighOrch->getNextHopRefCount(oldNh);
+            newRefs = gNeighOrch->getNextHopRefCount(newNh);
+            oldId = nhg().getId();
+            oldKey = nhg().getNhgKey();
+        }
+
+        void proposeFencedMove()
+        {
+            ASSERT_TRUE(gIntfsOrch->m_intfGuard.prepareCurrent("Ethernet0", "1"));
+            consumer->addToSync(KeyOpFieldsValuesTuple("guard-proof", SET_COMMAND,
+                {{"nexthop", "10.0.0.2"}, {"ifname", "Ethernet0"}}));
+        }
+
+        void expectMoveRetained()
+        {
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                SCOPED_TRACE(pass);
+                static_cast<Orch *>(gNhgOrch)->doTask();
+                EXPECT_EQ(1u, consumer->m_toSync.size());
+                EXPECT_TRUE(nhg().isSynced());
+                EXPECT_EQ(oldRefs, gNeighOrch->getNextHopRefCount(oldNh));
+                EXPECT_EQ(newRefs, gNeighOrch->getNextHopRefCount(newNh));
+                EXPECT_EQ(oldId, nhg().getId());
+                EXPECT_EQ(oldKey, nhg().getNhgKey());
+            }
+        }
+
+        void releaseAndExpectMoved()
+        {
+            ASSERT_TRUE(gIntfsOrch->m_intfGuard.retire("Ethernet0"));
+            ASSERT_TRUE(gIntfsOrch->m_intfGuard.release("Ethernet0", "1"));
+            static_cast<Orch *>(gNhgOrch)->doTask();
+            EXPECT_TRUE(consumer->m_toSync.empty());
+            EXPECT_TRUE(nhg().isSynced());
+            EXPECT_EQ(gNeighOrch->getNextHopId(newNh), nhg().getId());
+            EXPECT_EQ(NextHopGroupKey(newNh.to_string()), nhg().getNhgKey());
+        }
+
+        void withdraw()
+        {
+            consumer->addToSync(KeyOpFieldsValuesTuple("guard-proof", DEL_COMMAND, {}));
+            static_cast<Orch *>(gNhgOrch)->doTask();
+            EXPECT_TRUE(consumer->m_toSync.empty());
+        }
+    };
+
+    TEST_F(RouteOrchTest, NhgGuardExistingUpdateRetainsAcrossRetries)
+    {
+        NhgMoveCase c;
+        ASSERT_NO_FATAL_FAILURE(c.seed());
+        c.consumer->addToSync(KeyOpFieldsValuesTuple("guard-proof", SET_COMMAND,
+            {{"nexthop", "11.0.0.2"}, {"ifname", "Ethernet4"}}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        ASSERT_TRUE(c.consumer->m_toSync.empty());
+        ASSERT_TRUE(gNhgOrch->getNhg("guard-proof").isSynced());
+        c.snapshot();
+        ASSERT_NO_FATAL_FAILURE(c.proposeFencedMove());
+        c.expectMoveRetained();
+        ASSERT_NO_FATAL_FAILURE(c.releaseAndExpectMoved());
+        c.withdraw();
+    }
+
+    TEST_F(RouteOrchTest, NhgGuardPendingSetSupersededByDel)
+    {
+        NhgMoveCase c;
+        ASSERT_NO_FATAL_FAILURE(c.seed());
+        c.consumer->addToSync(KeyOpFieldsValuesTuple("guard-proof", SET_COMMAND,
+            {{"nexthop", "11.0.0.2"}, {"ifname", "Ethernet4"}}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        ASSERT_TRUE(c.consumer->m_toSync.empty());
+        ASSERT_TRUE(gNhgOrch->getNhg("guard-proof").isSynced());
+        c.snapshot();
+        ASSERT_NO_FATAL_FAILURE(c.proposeFencedMove());
+        c.expectMoveRetained();
+        c.consumer->addToSync(KeyOpFieldsValuesTuple("guard-proof", DEL_COMMAND, {}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        EXPECT_TRUE(c.consumer->m_toSync.empty());
+        EXPECT_FALSE(gNhgOrch->hasNhg("guard-proof"));
+        ASSERT_TRUE(gIntfsOrch->m_intfGuard.cancel("Ethernet0", "1"));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        EXPECT_FALSE(gNhgOrch->hasNhg("guard-proof"));
+    }
+
+    TEST_F(RouteOrchTest, NhgGuardTempResourceLimitRetainsAcrossRetries)
+    {
+        NhgMoveCase c;
+        ASSERT_NO_FATAL_FAILURE(c.seed());
+        const auto savedMax = gRouteOrch->m_maxNextHopGroupCount;
+        gRouteOrch->m_maxNextHopGroupCount = 0;
+        c.consumer->addToSync(KeyOpFieldsValuesTuple("guard-proof", SET_COMMAND,
+            {{"nexthop", "11.0.0.2,11.0.0.3"}, {"ifname", "Ethernet4,Ethernet4"}}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        ASSERT_EQ(1u, c.consumer->m_toSync.size());
+        ASSERT_TRUE(gNhgOrch->getNhg("guard-proof").isTemp());
+        ASSERT_TRUE(gNhgOrch->getNhg("guard-proof").isSynced());
+        c.snapshot();
+        ASSERT_NO_FATAL_FAILURE(c.proposeFencedMove());
+        c.expectMoveRetained();
+        gRouteOrch->m_maxNextHopGroupCount = savedMax;
+        ASSERT_NO_FATAL_FAILURE(c.releaseAndExpectMoved());
+        c.withdraw();
+    }
+
+    TEST_F(RouteOrchTest, NhgGuardTempPromotionRetainsAcrossRetries)
+    {
+        NhgMoveCase c;
+        ASSERT_NO_FATAL_FAILURE(c.seed());
+        const auto savedMax = gRouteOrch->m_maxNextHopGroupCount;
+        gRouteOrch->m_maxNextHopGroupCount = 0;
+        c.consumer->addToSync(KeyOpFieldsValuesTuple("guard-proof", SET_COMMAND,
+            {{"nexthop", "11.0.0.2,11.0.0.3"}, {"ifname", "Ethernet4,Ethernet4"}}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        ASSERT_EQ(1u, c.consumer->m_toSync.size());
+        ASSERT_TRUE(gNhgOrch->getNhg("guard-proof").isTemp());
+        ASSERT_TRUE(gNhgOrch->getNhg("guard-proof").isSynced());
+        c.snapshot();
+        gRouteOrch->m_maxNextHopGroupCount = savedMax;
+        ASSERT_NO_FATAL_FAILURE(c.proposeFencedMove());
+        c.expectMoveRetained();
+        ASSERT_NO_FATAL_FAILURE(c.releaseAndExpectMoved());
+        c.withdraw();
+    }
+
+    TEST_F(RouteOrchTest, DeferredMplsNextHopDoesNotReadMissingId)
+    {
+        gIntfsOrch->m_intfGuard = IntfGuard{};
+        ASSERT_TRUE(gIntfsOrch->m_intfGuard.prepareCurrent("Ethernet0", "1"));
+        ASSERT_TRUE(gIntfsOrch->isIntfBindingGuarded("Ethernet0"));
+
+        const NextHopKey neighbor("10.0.0.2@Ethernet0");
+        const NextHopKey labeled("push101+10.0.0.2@Ethernet0");
+        ASSERT_TRUE(gNeighOrch->hasNextHop(neighbor));
+        ASSERT_FALSE(gNeighOrch->hasNextHop(labeled));
+        const NextHopGroupKey nextHops(labeled.to_string());
+        RouteBulkContext ctx("198.51.100.0/24", true);
+        ctx.vrf_id = gVirtualRouterId;
+        ctx.ip_prefix = IpPrefix(ctx.key);
+
+        EXPECT_FALSE(gRouteOrch->addRoute(ctx, nextHops));
+        EXPECT_TRUE(ctx.object_statuses.empty());
+        EXPECT_FALSE(gNeighOrch->hasNextHop(labeled));
+    }
+
+    TEST_F(RouteOrchTest, DeferredEcmpMplsNextHopDoesNotReadMissingId)
+    {
+        gIntfsOrch->m_intfGuard = IntfGuard{};
+        ASSERT_TRUE(gIntfsOrch->m_intfGuard.prepareCurrent("Ethernet0", "1"));
+        ASSERT_TRUE(gIntfsOrch->isIntfBindingGuarded("Ethernet0"));
+        ASSERT_TRUE(gNeighOrch->hasNextHop(NextHopKey("10.0.0.2@Ethernet0")));
+        ASSERT_TRUE(gNeighOrch->hasNextHop(NextHopKey("10.0.0.3@Ethernet0")));
+        const NextHopGroupKey nextHops("push101+10.0.0.2@Ethernet0,push102+10.0.0.3@Ethernet0");
+        ASSERT_FALSE(gRouteOrch->hasNextHopGroup(nextHops));
+
+        EXPECT_FALSE(gRouteOrch->addNextHopGroup(nextHops));
+        EXPECT_FALSE(gRouteOrch->hasNextHopGroup(nextHops));
+        EXPECT_FALSE(gNeighOrch->hasNextHop(NextHopKey("push101+10.0.0.2@Ethernet0")));
+        EXPECT_FALSE(gNeighOrch->hasNextHop(NextHopKey("push102+10.0.0.3@Ethernet0")));
+    }
+
+    TEST_F(RouteOrchTest, GuardedDirectLabelDoesNotAcquireExistingRif)
+    {
+        gIntfsOrch->m_intfGuard = IntfGuard{};
+        ASSERT_TRUE(gIntfsOrch->m_intfGuard.prepareCurrent("Ethernet0", "1"));
+        ASSERT_TRUE(gIntfsOrch->isIntfBindingGuarded("Ethernet0"));
+        ASSERT_NE(SAI_NULL_OBJECT_ID, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+
+        LabelRouteBulkContext ctx;
+        ctx.vrf_id = gVirtualRouterId;
+        ctx.label = 101;
+        ctx.pop_count = 1;
+        const NextHopGroupKey nextHops("0.0.0.0@Ethernet0");
+        EXPECT_FALSE(gRouteOrch->addLabelRoute(ctx, nextHops));
+        EXPECT_TRUE(ctx.object_statuses.empty());
+        EXPECT_NE(SAI_NULL_OBJECT_ID, gIntfsOrch->getRouterIntfsId("Ethernet0"));
+    }
+
     TEST_F(RouteOrchTest, RouteOrchTempRouteUniformSelection)
     {
         // --- Step 1: Setup resolved neighbors ---

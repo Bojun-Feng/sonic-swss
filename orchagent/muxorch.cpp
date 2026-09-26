@@ -16,6 +16,9 @@
 #include "orch.h"
 #include "request_parser.h"
 #include "muxorch.h"
+#include "intfsorch.h"
+
+extern IntfsOrch *gIntfsOrch;
 #include "directory.h"
 #include "swssnet.h"
 #include "crmorch.h"
@@ -2913,6 +2916,11 @@ void MuxCableOrch::removeTunnelRoute(const NextHopKey &nhKey)
     app_tunnel_route_table_.del(key);
 }
 
+bool MuxCable::hasBindingGuard() const
+{
+    return gIntfsOrch->isIntfBindingGuarded(nbr_handler_->getAlias());
+}
+
 bool MuxCableOrch::addOperation(const Request& request)
 {
     SWSS_LOG_ENTER();
@@ -2928,6 +2936,13 @@ bool MuxCableOrch::addOperation(const Request& request)
 
     auto state = request.getAttrString("state");
     auto mux_obj = mux_orch->getMuxCable(port_name);
+
+    // Keep the request with its real retry owner, before any state transition
+    // or rollback. Do not change handling of unrelated legacy failures.
+    if (state == "active" && mux_obj->hasBindingGuard())
+    {
+        return false;
+    }
 
     try
     {
