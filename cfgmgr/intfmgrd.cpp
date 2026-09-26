@@ -6,6 +6,7 @@
 #include "exec.h"
 #include "schema.h"
 #include "intfmgr.h"
+#include "notificationconsumer.h"
 #include <fstream>
 #include <iostream>
 #include "warm_restart.h"
@@ -54,6 +55,11 @@ int main(int argc, char **argv)
             s.addSelectables(o->getSelectables());
         }
 
+        // Wake on the acknowledgment, rather than adding a full idle timeout
+        // to an otherwise ready bind. The retained STATE row remains authority.
+        NotificationConsumer guardAck(&stateDb, "INTF_GUARD_ACK");
+        s.addSelectable(&guardAck);
+
         Table table(&cfgDb, "DEVICE_METADATA");
         string mac = "";
         if (!table.hget("localhost", "mac", mac))
@@ -82,8 +88,17 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            auto *c = (Executor *)sel;
-            c->execute();
+            if (sel == &guardAck)
+            {
+                string op, data;
+                vector<FieldValueTuple> values;
+                guardAck.pop(op, data, values);
+            }
+            else
+            {
+                auto *c = (Executor *)sel;
+                c->execute();
+            }
 
             // Unrelated table events must not starve pending interface retries.
             intfmgr.doTask();

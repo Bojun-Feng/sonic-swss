@@ -80,18 +80,20 @@ def main():
             first_line = sources[path][:start].count('\n') + 1
             (build / name).write_text('#line %d "%s"\n%s\n' % (first_line, path, code))
             manifest['definitions'][name] = {'source': path, 'first_line': first_line, 'sha256': hashlib.sha256(code.encode()).hexdigest()}
-        for name in ('dbconnector.h', 'select.h', 'exec.h', 'schema.h', 'intfmgr.h', 'warm_restart.h'):
+        for name in ('dbconnector.h', 'select.h', 'exec.h', 'schema.h', 'intfmgr.h', 'warm_restart.h', 'notificationconsumer.h'):
             (build / name).write_text('#include "fixture.hpp"\n')
         (build / 'source-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         command = shlex.split(os.environ.get('CXX', 'c++')) + [
             '-std=c++14', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
             '-I' + str(build), '-I' + str(HERE), str(HERE / 'retry_test.cpp')]
+        if not revision:
+            command.append('-DTEST_GUARD_ACK')
         step(variant + '-build', command + ['-o', build / 'test'])
         step(variant + '-run', [build / 'test'], 1 if revision else 0,
-             (5, 4) if revision else (9, 0))
+             (5, 4) if revision else (10, 0))
         if not revision:
             step('ubsan-build', command + ['-fsanitize=undefined', '-fno-sanitize-recover=all', '-o', build / 'test-ubsan'])
-            step('ubsan-run', [build / 'test-ubsan'], summary=(9, 0))
+            step('ubsan-run', [build / 'test-ubsan'], summary=(10, 0))
     print('PASS source-linked dispatcher regression; evidence:', out)
 
 

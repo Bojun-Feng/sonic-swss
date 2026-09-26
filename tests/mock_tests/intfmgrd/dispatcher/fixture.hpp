@@ -71,6 +71,16 @@ struct Scenario {
 };
 extern Scenario* active;
 class Selectable { public: virtual ~Selectable() = default; };
+class NotificationConsumer : public Selectable {
+    string channel;
+public:
+    NotificationConsumer(DBConnector*, const string& name) : channel(name) {}
+    const string& getChannelName() const { return channel; }
+    void pop(string& op, string& data, vector<FieldValueTuple>& values) {
+        op = "ack"; data = "wake-only"; values.clear();
+        active->trace.push_back("notification:" + channel);
+    }
+};
 class Executor : public Selectable {
     string name;
 public:
@@ -162,6 +172,9 @@ class Select {
     map<string, Selectable*> inputs;
 public:
     enum { ERROR = -1, OBJECT = 0, TIMEOUT = 1 };
+    void addSelectable(NotificationConsumer* value) {
+        inputs.emplace(value->getChannelName(), value);
+    }
     void addSelectables(const vector<Selectable*>& values) {
         for (auto* value : values) inputs.emplace(static_cast<Executor*>(value)->getName(), value);
     }

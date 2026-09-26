@@ -48,6 +48,15 @@ static void busy(const string& table) {
 
 int main() {
     vector<pair<string, function<void()>>> tests{
+#ifdef TEST_GUARD_ACK
+        {"guard_notification_wakes_retry_without_TIMEOUT", [] {
+            auto result = run({root(), {Select::OBJECT, "INTF_GUARD_ACK", {}, true, false}});
+            completed(result, "Ethernet0", 1);
+            require(result.timeouts == 0, "ack waited for idle timeout");
+            require(find(result.trace.begin(), result.trace.end(), "notification:INTF_GUARD_ACK") != result.trace.end(),
+                    "notification was not consumed before the retry sweep");
+        }},
+#endif
         {"busy_PORT_retries_owning_CONFIG_without_TIMEOUT", [] { busy(STATE_PORT_TABLE_NAME); }},
         {"busy_LAG_retries_owning_CONFIG_without_TIMEOUT", [] { busy(STATE_LAG_TABLE_NAME); }},
         {"mixed_events_retry_all_pending_interface_consumers", [] {

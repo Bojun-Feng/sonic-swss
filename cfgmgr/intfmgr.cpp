@@ -5,6 +5,8 @@
 #include "tokenize.h"
 #include "ipprefix.h"
 #include "intfmgr.h"
+#include <net/if.h>
+#include <cerrno>
 #include "exec.h"
 #include "shellcmd.h"
 #include "macaddress.h"
@@ -12,6 +14,8 @@
 #include "subscriberstatetable.h"
 #include <swss/redisutility.h>
 #include "subintf.h"
+#include "intfguard.h"
+#include <limits>
 
 using namespace std;
 using namespace swss;
@@ -44,6 +48,8 @@ IntfMgr::IntfMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
         m_stateIntfTable(stateDb, STATE_INTERFACE_TABLE_NAME),
         m_appIntfTableProducer(appDb, APP_INTF_TABLE_NAME),
         m_appSagTableProducer(appDb, APP_SAG_TABLE_NAME),
+        m_appIntfGuardProducer(appDb, APP_INTF_GUARD_TABLE_NAME),
+        m_stateIntfGuardTable(stateDb, STATE_INTF_GUARD_TABLE_NAME),
         m_neighTable(appDb, APP_NEIGH_TABLE_NAME),
         m_appLagTable(appDb, APP_LAG_TABLE_NAME)
 {
@@ -77,6 +83,73 @@ IntfMgr::IntfMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
     if(cfgDeviceMetaDataTable.hget("localhost", "switch_type", swtype))
     {
        mySwitchType = swtype;
+    }
+
+    // A process restart may lose CONFIG notifications, but must not strand a
+    // fence introduced by this protocol. Reconcile only our retained requests.
+    vector<string> aliases;
+    m_stateIntfGuardTable.getKeys(aliases);
+    for (const auto &alias : aliases)
+    {
+        string action, pending;
+        m_stateIntfGuardTable.hget(alias, "action", action);
+        m_stateIntfGuardTable.hget(alias, "kernel_pending", pending);
+        if (action != "prepare" && pending != "1")
+        {
+            continue;
+        }
+        bool configured = false;
+        string configuredVrf;
+        for (const auto &name : tableNames)
+        {
+            Table table(cfgDb, name);
+            vector<FieldValueTuple> fields;
+            if (table.get(alias, fields))
+            {
+                configured = true;
+                for (const auto &field : fields)
+                {
+                    if (fvField(field) == "vrf_name" || fvField(field) == "vnet_name")
+                    {
+                        configuredVrf = fvValue(field);
+                    }
+                }
+                break;
+            }
+        }
+        string target;
+        m_stateIntfGuardTable.hget(alias, "target_vrf", target);
+        // An existing root and a nomaster request retain a removal even before
+        // the first kernel attempt. Replay its DEL before a different-VRF SET;
+        // that SET must not be consumed as an unsupported direct VRF change.
+        const bool retainedRemoval = target.empty() && isIntfCreated(alias);
+        if (configured && !(retainedRemoval && isIntfChangeVrf(alias, configuredVrf)))
+        {
+            continue; // Includes same-VRF cancellation/retry of an active request.
+        }
+        if (pending != "1" && !retainedRemoval)
+        {
+            finishBinding(alias, "cancel");
+            continue;
+        }
+        // The old APP root remains until checked removal completes. Recover its
+        // link-local cleanup obligation when CONFIG and the local cache are gone.
+        Table appIntfTable(appDb, APP_INTF_TABLE_NAME);
+        string linkLocalMode;
+        if (appIntfTable.hget(alias, "ipv6_use_link_local_only", linkLocalMode) && linkLocalMode == "enable")
+        {
+            m_ipv6LinkLocalModeList.insert(alias);
+        }
+        string name = CFG_INTF_TABLE_NAME;
+        if (alias.find('.') != string::npos) name = CFG_VLAN_SUB_INTF_TABLE_NAME;
+        else if (alias.find(VLAN_PREFIX) == 0) name = CFG_VLAN_INTF_TABLE_NAME;
+        else if (alias.find(LAG_PREFIX) == 0) name = CFG_LAG_INTF_TABLE_NAME;
+        auto consumer = dynamic_cast<Consumer *>(getExecutor(name));
+        if (consumer)
+        {
+            const KeyOpFieldsValuesTuple removal{alias, DEL_COMMAND, {}};
+            consumer->addToSync(removal);
+        }
     }
 }
 
@@ -193,7 +266,61 @@ void IntfMgr::setIntfMac(const string &alias, const string &mac_str)
     }
 }
 
-void IntfMgr::setIntfVrf(const string &alias, const string &vrfName)
+bool IntfMgr::prepareBinding(const string &alias, const string &vrfName)
+{
+    // This is the binding being applied now, not the target of a future bind.
+    // Persist before notification: queued requests must match this current row.
+    string id, action, target;
+    m_stateIntfGuardTable.hget(alias, "request_id", id);
+    m_stateIntfGuardTable.hget(alias, "action", action);
+    m_stateIntfGuardTable.hget(alias, "target_vrf", target);
+    if (id.empty() || action != "prepare" || target != vrfName)
+    {
+        uint64_t generation = id.empty() ? 0 : stoull(id);
+        if (generation == numeric_limits<uint64_t>::max())
+        {
+            SWSS_LOG_ERROR("Binding generation exhausted on %s", alias.c_str());
+            return false;
+        }
+        id = to_string(generation + 1);
+        m_stateIntfGuardTable.set(alias, {{"request_id", id}, {"action", "prepare"},
+                                        {"target_vrf", vrfName}});
+    }
+    string acknowledged, status;
+    m_stateIntfGuardTable.hget(alias, "id", acknowledged);
+    m_stateIntfGuardTable.hget(alias, "state", status);
+    if (acknowledged == id && (status == "guarded" || status == "retired"))
+    {
+        // Retried kernel work must not create another prepare/ack wakeup cycle.
+        // Retained STATE also permits progress when the notification was lost.
+        return true;
+    }
+    m_appIntfGuardProducer.set(alias, {{"id", id}, {"action", "prepare"}});
+    return false;
+}
+
+void IntfMgr::finishBinding(const string &alias, const string &action)
+{
+    string id;
+    if (!m_stateIntfGuardTable.hget(alias, "request_id", id))
+    {
+        return;
+    }
+    m_stateIntfGuardTable.set(alias, {{"action", action}});
+    if (action == "applied")
+    {
+        m_stateIntfGuardTable.set(alias, {{"applied_id", id}});
+    }
+    m_appIntfGuardProducer.set(alias, {{"id", id}, {"action", action}});
+}
+
+bool IntfMgr::isIntfAbsent(const string &alias) const
+{
+    errno = 0;
+    return if_nametoindex(alias.c_str()) == 0 && (errno == ENODEV || errno == ENXIO);
+}
+
+bool IntfMgr::setIntfVrf(const string &alias, const string &vrfName)
 {
     stringstream cmd;
     string res;
@@ -211,6 +338,7 @@ void IntfMgr::setIntfVrf(const string &alias, const string &vrfName)
     {
         SWSS_LOG_ERROR("Command '%s' failed with rc %d", cmd.str().c_str(), ret);
     }
+    return ret == 0;
 }
 
 bool IntfMgr::setIntfMpls(const string &alias, const string& mpls)
@@ -952,6 +1080,23 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             return true;
         }
 
+        string kernelPending;
+        m_stateIntfGuardTable.hget(alias, "kernel_pending", kernelPending);
+        const bool bindingGuarded = !is_lo &&
+                                    ((!isIntfCreated(alias) && !vrf_name.empty()) || kernelPending == "1");
+        if (bindingGuarded && !prepareBinding(alias, vrf_name))
+        {
+            return false;
+        }
+        if (!bindingGuarded && !is_lo)
+        {
+            string action;
+            if (m_stateIntfGuardTable.hget(alias, "action", action) && action == "prepare")
+            {
+                finishBinding(alias, "cancel");
+            }
+        }
+
         if (is_lo)
         {
             if (m_loopbackIntfList.find(alias) == m_loopbackIntfList.end())
@@ -1107,9 +1252,17 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             setSubIntfStateOk(alias);
         }
 
-        if (!vrf_name.empty())
+        if (bindingGuarded)
         {
-            setIntfVrf(alias, vrf_name);
+            // Retain syscall uncertainty across retries and supersession.
+            m_stateIntfGuardTable.set(alias, {{"kernel_pending", "1"}});
+        }
+        if (!vrf_name.empty() || kernelPending == "1")
+        {
+            if (!setIntfVrf(alias, vrf_name) && bindingGuarded)
+            {
+                return false;
+            }
         }
 
         /*Set the mac of interface*/
@@ -1198,7 +1351,15 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
         }
 
         m_appIntfTableProducer.set(alias, data);
+        if (bindingGuarded)
+        {
+            finishBinding(alias, "applied");
+        }
         m_stateIntfTable.hset(alias, "vrf", vrf_name);
+        if (bindingGuarded)
+        {
+            m_stateIntfGuardTable.set(alias, {{"kernel_pending", "0"}});
+        }
     }
     else if (op == DEL_COMMAND)
     {
@@ -1209,11 +1370,29 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             return false;
         }
 
-        setIntfVrf(alias, "");
+        string oldVrf;
+        m_stateIntfTable.hget(alias, "vrf", oldVrf);
+        string kernelPending;
+        m_stateIntfGuardTable.hget(alias, "kernel_pending", kernelPending);
+        const bool bindingGuarded = !is_lo &&
+            ((!oldVrf.empty() && oldVrf != "None") || kernelPending == "1");
+        if (bindingGuarded && !prepareBinding(alias, ""))
+        {
+            return false;
+        }
+        if (bindingGuarded)
+        {
+            m_stateIntfGuardTable.set(alias, {{"kernel_pending", "1"}});
+        }
+        if (!setIntfVrf(alias, "") && bindingGuarded && !isIntfAbsent(alias))
+        {
+            return false;
+        }
+        const bool deviceAbsent = isIntfAbsent(alias);
 
         // Check the kernel while the device still exists. A failed command or
         // nonempty readback must not consume the link-local cleanup obligation.
-        if (m_ipv6LinkLocalModeList.count(alias) && !cleanupLinkLocalNeigh(alias))
+        if (m_ipv6LinkLocalModeList.count(alias) && !deviceAbsent && !cleanupLinkLocalNeigh(alias))
         {
             return false;
         }
@@ -1226,7 +1405,10 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
 
         if (!parentAlias.empty())
         {
-            removeHostSubIntf(alias);
+            if (!deviceAbsent)
+            {
+                removeHostSubIntf(alias);
+            }
             m_subIntfList.erase(alias);
 
             removeSubIntfState(alias);
@@ -1254,7 +1436,24 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
         }
 
         m_appIntfTableProducer.del(alias);
+        if (bindingGuarded)
+        {
+            finishBinding(alias, "applied");
+        }
+        else
+        {
+            // CONFIG deletion may supersede a prepare before Linux moved.
+            string action;
+            if (m_stateIntfGuardTable.hget(alias, "action", action) && action == "prepare")
+            {
+                finishBinding(alias, "cancel");
+            }
+        }
         m_stateIntfTable.del(alias);
+        if (bindingGuarded)
+        {
+            m_stateIntfGuardTable.set(alias, {{"kernel_pending", "0"}});
+        }
     }
     else
     {
@@ -1389,6 +1588,7 @@ void IntfMgr::doTask(Consumer &consumer)
 
     string table_name = consumer.getTableName();
 
+    set<string> pendingRootRemovals;
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
@@ -1402,6 +1602,14 @@ void IntfMgr::doTask(Consumer &consumer)
             vector<string> keys = tokenize(kfvKey(t), config_db_key_delimiter);
             const vector<FieldValueTuple>& data = kfvFieldsValues(t);
             string op = kfvOp(t);
+
+            // A retained root DEL must precede both a same-key root SET and
+            // new address SETs. Continue withdrawals and unrelated aliases.
+            if (op == SET_COMMAND && pendingRootRemovals.count(keys[0]))
+            {
+                ++it;
+                continue;
+            }
 
             if (keys.size() == 1)
             {
@@ -1425,6 +1633,10 @@ void IntfMgr::doTask(Consumer &consumer)
 
                 if (!doIntfGeneralTask(keys, data, op))
                 {
+                    if (op == DEL_COMMAND)
+                    {
+                        pendingRootRemovals.insert(keys[0]);
+                    }
                     it++;
                     continue;
                 }
