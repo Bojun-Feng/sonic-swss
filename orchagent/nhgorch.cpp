@@ -26,6 +26,27 @@ NhgOrch::NhgOrch(DBConnector *db, string tableName) : NhgOrchCommon(db, tableNam
     SWSS_LOG_ENTER();
 }
 
+void NhgOrch::doTask()
+{
+    SWSS_LOG_ENTER();
+    Orch::doTask();
+    if (!gPortsOrch->allPortsReady())
+    {
+        return;
+    }
+
+    // Process current SET/DEL work before replaying refused link-up callbacks.
+    auto pending = m_pendingValidations;
+    m_pendingValidations.clear();
+    for (const auto &nh : pending)
+    {
+        if (gNeighOrch->hasNextHop(nh) && !gNeighOrch->isNextHopFlagSet(nh, NHFLAGS_IFDOWN))
+        {
+            validateNextHop(nh);
+        }
+    }
+}
+
 /*
  * Purpose:     Perform the operations requested by APPL_DB users.
  * Description: Iterate over the untreated operations list and resolve them.
@@ -464,13 +485,13 @@ void NhgOrch::doTask(Consumer& consumer)
  * Description: Iterate over all next hop groups and validate the next hop in
  *              those who contain it.
  * Params:      IN  nh_key - The next hop to validate.
- * Returns:     true, if the next hop was successfully validated in all
- *              containing groups;
- *              false, otherwise.
+ * Returns:     true, if validation completed or is retained for guard release;
+ *              false, on an unretained failure.
  */
 bool NhgOrch::validateNextHop(const NextHopKey& nh_key)
 {
     SWSS_LOG_ENTER();
+    m_pendingValidations.erase(nh_key);
 
     /*
      * Iterate through all groups and validate the next hop in those who
@@ -488,6 +509,12 @@ bool NhgOrch::validateNextHop(const NextHopKey& nh_key)
              */
             if (!nhg->validateNextHop(nh_key))
             {
+                if (gIntfsOrch->isIntfBindingGuarded(nh_key.alias))
+                {
+                    m_pendingValidations.insert(nh_key);
+                    // Accepted retry work must not stop other neighbors' UP notifications.
+                    continue;
+                }
                 SWSS_LOG_ERROR("Failed to validate next hop %s in group %s",
                                 nh_key.to_string().c_str(),
                                 it.first.c_str());
@@ -511,6 +538,7 @@ bool NhgOrch::validateNextHop(const NextHopKey& nh_key)
 bool NhgOrch::invalidateNextHop(const NextHopKey& nh_key)
 {
     SWSS_LOG_ENTER();
+    m_pendingValidations.erase(nh_key);
 
     /*
      * Iterate through all groups and invalidate the next hop from those who

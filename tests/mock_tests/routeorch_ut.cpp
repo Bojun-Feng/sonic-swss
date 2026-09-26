@@ -3,6 +3,9 @@
 #undef private
 #define protected public
 #include "orch.h"
+#define private public
+#include "nhgorch.h"
+#undef private
 #undef protected
 #include "ut_helper.h"
 #include "mock_orchagent_main.h"
@@ -478,6 +481,145 @@ namespace routeorch_test
             ut_helper::uninitSaiApi();
         }
     };
+
+    static void prepareNhgLinkNeighbors()
+    {
+        Table vrfs(m_app_db.get(), APP_VRF_TABLE_NAME);
+        vrfs.set("Vrf1", {{"NULL", "NULL"}});
+        gVrfOrch->addExistingData(&vrfs);
+        static_cast<Orch *>(gVrfOrch)->doTask();
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        Table neighbors(m_app_db.get(), APP_NEIGH_TABLE_NAME);
+        neighbors.set("Ethernet8:20.0.0.2", {{"neigh", "00:00:14:00:00:02"}, {"family", "IPv4"}});
+        neighbors.set("Ethernet8:20.0.0.3", {{"neigh", "00:00:14:00:00:03"}, {"family", "IPv4"}});
+        gNeighOrch->addExistingData(&neighbors);
+        static_cast<Orch *>(gNeighOrch)->doTask();
+    }
+
+
+    struct NhgGuardLinkTest : RouteOrchTest, testing::WithParamInterface<int>
+    {
+        void guard(const string &action)
+        {
+            Table state(m_state_db.get(), "INTERFACE_GUARD_TABLE");
+            string id;
+            state.hget("Ethernet8", "request_id", id);
+            if (action == "prepare")
+            {
+                id = to_string(id.empty() ? 1 : stoull(id) + 1);
+            }
+            state.set("Ethernet8", {{"request_id", id}, {"action", action},
+                {"target_vrf", ""}, {"kernel_pending", "0"},
+                {"applied_id", "0"}, {"retired_id", "0"}});
+            auto *consumer = gIntfsOrch->getConsumerBase("INTF_GUARD_TABLE");
+            ASSERT_NE(nullptr, consumer);
+            consumer->addToSync(KeyOpFieldsValuesTuple("Ethernet8", SET_COMMAND, {{"id", id}, {"action", action}}));
+            static_cast<Orch *>(gIntfsOrch)->doTask();
+        }
+
+        void TearDown() override
+        {
+            auto *consumer = gNhgOrch->getConsumerBase(APP_NEXTHOP_GROUP_TABLE_NAME);
+            consumer->addToSync(KeyOpFieldsValuesTuple("link-guard", DEL_COMMAND, {}));
+            static_cast<Orch *>(gNhgOrch)->doTask();
+            RouteOrchTest::TearDown();
+        }
+    };
+
+    TEST_P(NhgGuardLinkTest, LinkUpRecoveryAndSupersession)
+    {
+        prepareNhgLinkNeighbors();
+        const NextHopKey nh("20.0.0.2@Ethernet8");
+        const NextHopKey other("20.0.0.3@Ethernet8");
+        ASSERT_TRUE(gNeighOrch->hasNextHop(nh));
+        ASSERT_TRUE(gNeighOrch->hasNextHop(other));
+        const auto refs = gNeighOrch->getNextHopRefCount(nh);
+        const auto otherRefs = gNeighOrch->getNextHopRefCount(other);
+        auto *consumer = gNhgOrch->getConsumerBase(APP_NEXTHOP_GROUP_TABLE_NAME);
+        consumer->addToSync(KeyOpFieldsValuesTuple("link-guard", SET_COMMAND,
+            {{"nexthop", "20.0.0.2,20.0.0.3"}, {"ifname", "Ethernet8,Ethernet8"}}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        ASSERT_TRUE(consumer->m_toSync.empty());
+        ASSERT_TRUE(gNhgOrch->getNhg("link-guard").m_members.at(nh).isSynced());
+        ASSERT_TRUE(gNhgOrch->getNhg("link-guard").m_members.at(other).isSynced());
+        ASSERT_EQ(refs + 1, gNeighOrch->getNextHopRefCount(nh));
+        ASSERT_EQ(otherRefs + 1, gNeighOrch->getNextHopRefCount(other));
+        ASSERT_NO_FATAL_FAILURE(guard("prepare"));
+        ASSERT_TRUE(gIntfsOrch->isIntfBindingGuarded("Ethernet8"));
+        ASSERT_TRUE(gNeighOrch->ifChangeInformNextHop("Ethernet8", false));
+        ASSERT_TRUE(gNeighOrch->isNextHopFlagSet(nh, NHFLAGS_IFDOWN));
+        ASSERT_TRUE(gNeighOrch->isNextHopFlagSet(other, NHFLAGS_IFDOWN));
+        ASSERT_FALSE(gNhgOrch->getNhg("link-guard").m_members.at(nh).isSynced());
+        ASSERT_FALSE(gNhgOrch->getNhg("link-guard").m_members.at(other).isSynced());
+        EXPECT_TRUE(gNeighOrch->ifChangeInformNextHop("Ethernet8", true));
+        ASSERT_FALSE(gNeighOrch->isNextHopFlagSet(nh, NHFLAGS_IFDOWN));
+        EXPECT_FALSE(gNeighOrch->isNextHopFlagSet(other, NHFLAGS_IFDOWN));
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            static_cast<Orch *>(gNhgOrch)->doTask();
+            EXPECT_FALSE(gNhgOrch->getNhg("link-guard").m_members.at(nh).isSynced());
+            EXPECT_FALSE(gNhgOrch->getNhg("link-guard").m_members.at(other).isSynced());
+            EXPECT_TRUE(consumer->m_toSync.empty());
+        }
+        if (GetParam() == 1)
+        {
+            ASSERT_TRUE(gNeighOrch->ifChangeInformNextHop("Ethernet8", false));
+        }
+        else if (GetParam() == 2)
+        {
+            consumer->addToSync(KeyOpFieldsValuesTuple("link-guard", DEL_COMMAND, {}));
+        }
+        ASSERT_NO_FATAL_FAILURE(guard("cancel"));
+        ASSERT_FALSE(gIntfsOrch->isIntfBindingGuarded("Ethernet8"));
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            static_cast<Orch *>(gNhgOrch)->doTask();
+        }
+        EXPECT_TRUE(consumer->m_toSync.empty());
+        if (GetParam() == 2)
+        {
+            EXPECT_FALSE(gNhgOrch->hasNhg("link-guard"));
+        }
+        else
+        {
+            EXPECT_EQ(GetParam() == 0, gNhgOrch->getNhg("link-guard").m_members.at(nh).isSynced());
+            EXPECT_EQ(GetParam() == 0, gNhgOrch->getNhg("link-guard").m_members.at(other).isSynced());
+            EXPECT_EQ(GetParam() == 1, gNeighOrch->isNextHopFlagSet(nh, NHFLAGS_IFDOWN));
+            EXPECT_EQ(GetParam() == 1, gNeighOrch->isNextHopFlagSet(other, NHFLAGS_IFDOWN));
+        }
+        EXPECT_EQ(refs + (GetParam() == 0 ? 1 : 0), gNeighOrch->getNextHopRefCount(nh));
+        EXPECT_EQ(otherRefs + (GetParam() == 0 ? 1 : 0), gNeighOrch->getNextHopRefCount(other));
+    }
+
+    INSTANTIATE_TEST_SUITE_P(GuardCancellation, NhgGuardLinkTest, testing::Values(0, 1, 2));
+
+    TEST_F(RouteOrchTest, NhgUnfencedLinkUpRestoresMember)
+    {
+        prepareNhgLinkNeighbors();
+        const NextHopKey nh("20.0.0.2@Ethernet8");
+        const NextHopKey other("20.0.0.3@Ethernet8");
+        ASSERT_TRUE(gNeighOrch->hasNextHop(nh));
+        ASSERT_TRUE(gNeighOrch->hasNextHop(other));
+        const auto otherRefs = gNeighOrch->getNextHopRefCount(other);
+        auto *consumer = gNhgOrch->getConsumerBase(APP_NEXTHOP_GROUP_TABLE_NAME);
+        consumer->addToSync(KeyOpFieldsValuesTuple("link-control", SET_COMMAND,
+            {{"nexthop", "20.0.0.2,20.0.0.3"}, {"ifname", "Ethernet8,Ethernet8"}}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        EXPECT_TRUE(consumer->m_toSync.empty());
+        EXPECT_TRUE(gNhgOrch->getNhg("link-control").m_members.at(nh).isSynced());
+        EXPECT_TRUE(gNeighOrch->ifChangeInformNextHop("Ethernet8", false));
+        EXPECT_FALSE(gNhgOrch->getNhg("link-control").m_members.at(nh).isSynced());
+        EXPECT_TRUE(gNeighOrch->ifChangeInformNextHop("Ethernet8", true));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        EXPECT_TRUE(consumer->m_toSync.empty());
+        EXPECT_TRUE(gNhgOrch->getNhg("link-control").m_members.at(nh).isSynced());
+        EXPECT_TRUE(gNhgOrch->getNhg("link-control").m_members.at(other).isSynced());
+        EXPECT_FALSE(gNeighOrch->isNextHopFlagSet(other, NHFLAGS_IFDOWN));
+        EXPECT_EQ(otherRefs + 1, gNeighOrch->getNextHopRefCount(other));
+        consumer->addToSync(KeyOpFieldsValuesTuple("link-control", DEL_COMMAND, {}));
+        static_cast<Orch *>(gNhgOrch)->doTask();
+        EXPECT_FALSE(gNhgOrch->hasNhg("link-control"));
+    }
 
     struct NhgMoveCase
     {

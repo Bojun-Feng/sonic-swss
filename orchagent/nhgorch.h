@@ -122,6 +122,8 @@ public:
      */
     NhgOrch(DBConnector *db, string tableName);
 
+    void doTask() override;
+
     /* Add a temporary next hop group when resources are exhausted. */
     NextHopGroup createTempNhg(const NextHopGroupKey& nhg_key);
 
@@ -130,5 +132,6 @@ public:
     bool invalidateNextHop(const NextHopKey& nh_key);
 
 private:
+    std::set<NextHopKey> m_pendingValidations;
     void doTask(Consumer& consumer) override;
 };
