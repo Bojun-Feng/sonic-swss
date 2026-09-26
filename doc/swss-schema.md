@@ -8,6 +8,26 @@ Schema data is defined in ABNF [RFC5234](https://tools.ietf.org/html/rfc5234) sy
 
 ## Application DB schema
 
+### INTF_GUARD_TABLE (internal)
+
+IntfMgr publishes binding-order notifications. IntfsOrch accepts only the current
+request recorded in STATE_DB; deleting an APP row does not cancel retirement.
+This table adds no public CONFIG_DB or CLI fields.
+
+    key       = INTF_GUARD_TABLE:ifname
+    id        = 1*20DIGIT ; positive, monotonically increasing per-alias uint64
+    action    = "prepare" / "applied" / "cancel"
+
+The matching internal STATE_DB key is `INTERFACE_GUARD_TABLE|ifname`.
+IntfMgr owns `request_id`, `action`, `target_vrf` (empty means default),
+`kernel_pending` (`0` or `1`), and the latest `applied_id`. IntfsOrch owns `id`,
+`state` (`guarded`, `retired`, or `released`), and `retired_id`. Retain the final
+record for request correlation. An earlier applied ID remains a retirement
+obligation until retired, including after cancellation of a later prepare.
+These fields are not an operator-facing ASIC-removal completion signal.
+The STATE_DB notification channel `INTF_GUARD_ACK` wakes IntfMgr after an
+acknowledgment update; its payload is not authority to change a binding.
+
 ### PORT_TABLE
 Stores information for physical switch ports managed by the switch chip. Ports to the CPU (ie: management port) and logical ports (loopback) are not declared in the PORT_TABLE. See INTF_TABLE.
 

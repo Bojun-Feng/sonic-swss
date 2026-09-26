@@ -1,0 +1,9 @@
+sequenceDiagram
+    participant L as Linux
+    participant N as New route or neighbor
+    participant O as Orchagent
+    L->>L: Enter new VRF
+    N->>O: New desired work arrives
+    Note right of O: Old RIF still exists
+    O->>O: Acquire old RIF
+    Note over N,O: Wrong ownership<br/>also prevents retirement

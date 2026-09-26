@@ -1,0 +1,11 @@
+sequenceDiagram
+    participant M as IntfMgr
+    participant O as IntfsOrch
+    participant D as Existing owners
+    M->>O: applied(N)
+    Note over O,D: Old references still exist
+    M->>O: prepare(N+1), then cancel(N+1)
+    O->>O: Keep N retirement obligation and fence
+    D-->>O: Ordinary withdrawals release references
+    O->>O: Retire old RIF and close current request
+    Note over M,O: No future bind is required

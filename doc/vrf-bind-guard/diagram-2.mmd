@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant M as IntfMgr
+    participant O as IntfsOrch
+    participant D as Existing owners
+    M->>O: prepare(id)
+    O->>O: Hold new acquisitions
+    O-->>M: guarded(id)
+    M->>M: Stock Linux master or nomaster
+    M->>O: Normal interface work, applied(id)
+    M->>M: Stock STATE_DB completion
+    O->>D: Retire old neighbors and connected prefixes
+    D-->>O: Release old references
+    O->>O: Remove old RIF and release fence
+    O->>D: Retry current desired work
