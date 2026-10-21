@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <system_error>
 #include <sys/socket.h>
+#include <net/if.h>
 #include <linux/if.h>
 #include <netlink/route/link.h>
 #include <chrono>
@@ -22,6 +23,21 @@ using namespace swss;
 
 /* Taken from drivers/net/team/team.c */
 #define TEAM_DRV_NAME "team"
+
+/* True only when the kernel no longer has the team device a netlink event
+ * described: its ifindex is gone, or now belongs to another interface.  Any
+ * other lookup failure returns false so that the normal retries apply. */
+static bool isTeamDeviceGone(const string &lagName, int ifindex)
+{
+    char ifname[IF_NAMESIZE] = {0};
+
+    if (!if_indextoname(static_cast<unsigned int>(ifindex), ifname))
+    {
+        return errno == ENXIO;
+    }
+
+    return lagName != ifname;
+}
 
 TeamSync::TeamSync(DBConnector *db, DBConnector *stateDb, Select *select) :
     m_select(select),
@@ -190,9 +206,17 @@ void TeamSync::addLag(const string &lagName, int ifindex, bool admin_state,
         }
         catch (const system_error& e)
         {
-            SWSS_LOG_ERROR("addLag: Failed to initialize team handler for LAG %s "
-                           "(ifindex %d): %d:%s. Waiting for next RTM_NEWLINK.",
-                           lagName.c_str(), ifindex, e.code().value(), e.what());
+            if (isTeamDeviceGone(lagName, ifindex))
+            {
+                SWSS_LOG_NOTICE("LAG %s (ifindex %d) no longer exists, "
+                                "skipping stale RTM_NEWLINK", lagName.c_str(), ifindex);
+            }
+            else
+            {
+                SWSS_LOG_ERROR("addLag: Failed to initialize team handler for LAG %s "
+                               "(ifindex %d): %d:%s. Waiting for next RTM_NEWLINK.",
+                               lagName.c_str(), ifindex, e.code().value(), e.what());
+            }
         }
     }
     else
@@ -324,6 +348,13 @@ TeamSync::TeamPortSync::TeamPortSync(const string &lagName, int ifindex,
         }
         catch (const system_error& e)
         {
+            /* A deleted LAG cannot succeed on retry; its replacement receives
+             * a separate RTM_NEWLINK event. */
+            if (isTeamDeviceGone(lagName, ifindex))
+            {
+                throw;
+            }
+
             SWSS_LOG_WARN("Failed to initialize team handler. LAG=%s error=%d:%s, attempt=%d",
                           lagName.c_str(), e.code().value(), e.what(), count);
 
