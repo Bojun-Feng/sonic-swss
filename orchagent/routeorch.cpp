@@ -2102,6 +2102,25 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
 
     auto it_route = m_syncdRoutes.at(vrf_id).find(ipPrefix);
 
+    /* Like the interface next hop check below, do not let a route take a new reference
+     * on a next hop whose RIF is being removed (sonic-buildimage#29919): the route stays
+     * pending and any installed version is left as is. Next hops that the installed
+     * route already uses are kept until the control plane withdraws them. */
+    for (const auto &nexthop : nextHops.getNextHops())
+    {
+        if (nexthop.isIntfNextHop() || !m_intfsOrch->isIntfChangeInProgress(nexthop.alias))
+        {
+            continue;
+        }
+        if (it_route != m_syncdRoutes.at(vrf_id).end() && it_route->second.nhg_key.contains(nexthop))
+        {
+            continue;
+        }
+        SWSS_LOG_INFO("Interface %s is being removed, retry route %s later",
+                nexthop.alias.c_str(), ipPrefix.to_string().c_str());
+        return false;
+    }
+
     if (m_fgNhgOrch->isRouteFineGrained(vrf_id, ipPrefix, nextHops))
     {
         /* The route is pointing to a Fine Grained nexthop group */

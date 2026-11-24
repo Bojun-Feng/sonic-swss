@@ -1982,4 +1982,28 @@ namespace routeorch_test
         feed(nhg_consumer, gNhgOrch, {index, "DEL", {}});
         ASSERT_FALSE(gNhgOrch->hasNhg(index));
     }
+
+    TEST_F(RouteOrchTest, RouteOrchDefersNewNextHopOnRemovingInterface)
+    {
+        // Ethernet0 still has its prefix, neighbors and routes, so its DEL leaves it fenced
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", {}});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        // A new route that would take a new reference on 10.0.0.2@Ethernet0 stays pending
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        entries.clear();
+        entries.push_back({"2.2.2.0/24", "SET", { {"ifname", "Ethernet0"}, {"nexthop", "10.0.0.2"} }});
+        routeConsumer->addToSync(entries);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        ASSERT_EQ(routeConsumer->m_toSync.size(), static_cast<size_t>(1));
+        ASSERT_EQ(gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix("2.2.2.0/24")), NextHopGroupKey());
+
+        // A route that already uses the next hop keeps it
+        ASSERT_EQ(gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix("1.1.1.0/24")),
+                  NextHopGroupKey("10.0.0.2@Ethernet0"));
+    }
 }

@@ -879,4 +879,49 @@ namespace intfsorch_test
 
         ASSERT_NO_FATAL_FAILURE(expectRoutedPort());
     }
+
+    TEST_F(IntfsOrchTest, NeighOrchDefersNeighborOnRemovingInterface)
+    {
+        // NeighOrch::addNeighbor looks PortsOrch up in gDirectory; this fixture does not register it
+        if (!gDirectory.get<PortsOrch *>())
+        {
+            gDirectory.set(gPortsOrch);
+        }
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        auto neighConsumer = dynamic_cast<Consumer *>(gNeighOrch->getExecutor(APP_NEIGH_TABLE_NAME));
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "SET", { {"mtu", "9100"} }});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_NE(gIntfsOrch->getRouterIntfsId("Ethernet0"), SAI_NULL_OBJECT_ID);
+
+        // The interface DEL cannot complete yet, so the interface is being removed
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+        entries.clear();
+        entries.push_back({"Ethernet0", "DEL", {}});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        // A neighbor learned meanwhile is not created on the old RIF
+        entries.clear();
+        entries.push_back({"Ethernet0:10.0.0.1", "SET", { {"neigh", "00:00:0a:00:00:01"}, {"family", "IPv4"} }});
+        neighConsumer->addToSync(entries);
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        NextHopKey nexthop(IpAddress("10.0.0.1"), "Ethernet0");
+        ASSERT_FALSE(gNeighOrch->hasNextHop(nexthop));
+        ASSERT_EQ(neighConsumer->m_toSync.size(), static_cast<size_t>(1));
+
+        // The interface is re-added; the old RIF goes away and the neighbor is created on the new one
+        entries.clear();
+        entries.push_back({"Ethernet0", "SET", { {"mtu", "9100"} }});
+        intfConsumer->addToSync(entries);
+        gIntfsOrch->decreaseRouterIntfsRefCount("Ethernet0");
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_NE(gIntfsOrch->getRouterIntfsId("Ethernet0"), SAI_NULL_OBJECT_ID);
+        static_cast<Orch *>(gNeighOrch)->doTask();
+        ASSERT_TRUE(gNeighOrch->hasNextHop(nexthop));
+        ASSERT_TRUE(neighConsumer->m_toSync.empty());
+    }
 }

@@ -1108,6 +1108,20 @@ void NeighOrch::doTask(Consumer &consumer)
 
         if (op == SET_COMMAND)
         {
+            /* Do not take a new reference on a RIF that is being removed
+             * (sonic-buildimage#29919); retry once it is recreated. A SET for an
+             * existing entry, e.g. a DEL folded into a SET, releases the old entry. */
+            if (m_intfsOrch->isIntfChangeInProgress(alias))
+            {
+                SWSS_LOG_INFO("Interface %s is being removed, retry neighbor %s later",
+                        alias.c_str(), ip_address.to_string().c_str());
+                if (m_syncdNeighbors.count(neighbor_entry))
+                {
+                    removeNeighbor(ctx);
+                }
+                it++;
+                continue;
+            }
             Port p;
             if (!gPortsOrch->getPort(alias, p))
             {
