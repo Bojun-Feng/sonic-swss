@@ -1,4 +1,6 @@
 #include <string.h>
+#include <cerrno>
+#include <net/if.h>
 #include "logger.h"
 #include "dbconnector.h"
 #include "producerstatetable.h"
@@ -212,6 +214,11 @@ void IntfMgr::setIntfVrf(const string &alias, const string &vrfName)
     int ret = swss::exec(cmd.str(), res);
     if (ret)
     {
+        /* Nothing to unbind if the device is gone, e.g. a sub-interface removed with its parent */
+        if (vrfName.empty() && if_nametoindex(alias.c_str()) == 0 && errno == ENODEV)
+        {
+            return;
+        }
         SWSS_LOG_ERROR("Command '%s' failed with rc %d", cmd.str().c_str(), ret);
     }
 }
@@ -644,7 +651,17 @@ void IntfMgr::removeHostSubIntf(const string &subIntf)
     string res;
 
     cmd << IP_CMD " link del " << shellquote(subIntf);
-    EXEC_WITH_ERROR_THROW(cmd.str(), res);
+    int ret = swss::exec(cmd.str(), res);
+    if (ret)
+    {
+        /* The kernel removes a VLAN sub-interface together with its parent */
+        if (if_nametoindex(subIntf.c_str()) == 0 && errno == ENODEV)
+        {
+            SWSS_LOG_NOTICE("Sub interface %s is already removed", subIntf.c_str());
+            return;
+        }
+        throw runtime_error(cmd.str() + " : " + res);
+    }
 }
 
 void IntfMgr::setSubIntfStateOk(const string &alias)

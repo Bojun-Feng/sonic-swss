@@ -433,6 +433,26 @@ namespace intfmgr_ut
         EXPECT_FALSE(commandWasIssued("bridge fdb"));
     }
 
+    TEST_F(IntfMgrTest, testRemoveHostSubIntfAlreadyRemoved)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        callback = [](const std::string &cmd, std::string &stdout) {
+            if (cmd.find(" nomaster") != std::string::npos || cmd.find(" link del ") != std::string::npos)
+            {
+                mockCallArgs.push_back(cmd);
+                return 1;
+            }
+            return cb(cmd, stdout);
+        };
+
+        // The kernel already removed the sub-interface together with its parent: the DEL still completes
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet999.10"}, {}, DEL_COMMAND));
+        EXPECT_TRUE(commandWasIssued("/sbin/ip link set \"Ethernet999.10\" nomaster"));
+        EXPECT_TRUE(commandWasIssued("/sbin/ip link del \"Ethernet999.10\""));
+        // Any other failure still throws
+        EXPECT_THROW(intfmgr.removeHostSubIntf("lo"), std::runtime_error);
+    }
+
     static std::size_t intfDelsAtVrfUnbind = 0;
 
     TEST_F(IntfMgrTest, testRootDeletePublishedBeforeVrfUnbind)
