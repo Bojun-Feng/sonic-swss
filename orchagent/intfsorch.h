@@ -78,6 +78,8 @@ public:
     void voqSyncIntfState(string &alias, bool);
 
     bool isIntfChangeInProgress(const string &alias);
+    /* Called by RouteOrch when a route is set again through an interface being removed */
+    void notifyRouteSetOnRemovingIntf(const string &alias);
 
 private:
 
@@ -102,11 +104,14 @@ private:
 
     std::set<std::string> m_removingIntfses;
     std::set<std::string> m_rifWaitingForVlanExit;
+    /* Interfaces being removed that a route was set again through, see keepRifForSameVrfReAdd() */
+    std::set<std::string> m_removingIntfsRouteSeen;
 
     std::string getRifFlexCounterTableKey(std::string s);
 
     bool addRouterIntfs(sai_object_id_t vrf_id, Port &port, string loopbackAction);
     bool removeRouterIntfs(Port &port);
+    bool keepRifForSameVrfReAdd(const string &alias, const Port &port, const KeyOpFieldsValuesTuple &reAdd);
 
     void addDirectedBroadcast(const Port &port, const IpPrefix &ip_prefix);
     void removeDirectedBroadcast(const Port &port, const IpPrefix &ip_prefix);

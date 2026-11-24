@@ -924,4 +924,50 @@ namespace intfsorch_test
         ASSERT_TRUE(gNeighOrch->hasNextHop(nexthop));
         ASSERT_TRUE(neighConsumer->m_toSync.empty());
     }
+
+    TEST_F(IntfsOrchTest, IntfsOrchKeepsRifOnlyForSameVrfReAdd)
+    {
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"GLOBAL", "SET", {{"gateway_mac", "02:03:04:05:06:07"}}});
+        auto sagConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_SAG_TABLE_NAME));
+        sagConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        auto consumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        entries.clear();
+        entries.push_back({"Ethernet0", "SET", {{"mtu", "9100"}, {"static_anycast_gateway", "true"}}});
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        auto rif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(rif, SAI_NULL_OBJECT_ID);
+
+        // Ethernet0 is removed while its RIF is referenced, and a route is set again through it
+        gIntfsOrch->increaseRouterIntfsRefCount("Ethernet0");
+        entries.clear();
+        entries.push_back({"Ethernet0", "DEL", {}});
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        gIntfsOrch->notifyRouteSetOnRemovingIntf("Ethernet0");
+
+        // A bind to a VNET is not a same-VRF re-add: the DEL keeps waiting for the RIF to drain
+        entries.clear();
+        entries.push_back({"Ethernet0", "SET", {{"vnet_name", "Vnet1"}}});
+        consumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_EQ(consumer->m_toSync.count("Ethernet0"), static_cast<size_t>(2));
+
+        // A same-VRF re-add keeps the RIF, and SAG follows the re-added config
+        entries.clear();
+        entries.push_back({"Ethernet0", "DEL", {}});
+        entries.push_back({"Ethernet0", "SET", {{"NULL", "NULL"}}});
+        consumer->addToSync(entries);
+        auto current_remove_count = remove_rif_count;
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), rif);
+        ASSERT_EQ(current_remove_count, remove_rif_count);
+        ASSERT_EQ(consumer->m_toSync.count("Ethernet0"), static_cast<size_t>(0));
+        auto syncdIntfses = gIntfsOrch->getSyncdIntfses();
+        ASSERT_FALSE(syncdIntfses.at("Ethernet0").sag_enabled);
+    }
 }

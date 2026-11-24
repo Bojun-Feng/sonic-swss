@@ -18,6 +18,7 @@
 #include "directory.h"
 #include "vnetorch.h"
 #include "subscriberstatetable.h"
+#include "redisutility.h"
 
 extern sai_object_id_t gVirtualRouterId;
 extern Directory<Orch*> gDirectory;
@@ -199,6 +200,51 @@ void IntfsOrch::decreaseRouterIntfsRefCount(const string &alias)
 bool IntfsOrch::isIntfChangeInProgress(const string &alias)
 {
     return m_removingIntfses.find(alias) != m_removingIntfses.end();
+}
+
+void IntfsOrch::notifyRouteSetOnRemovingIntf(const string &alias)
+{
+    if (m_removingIntfses.count(alias))
+    {
+        m_removingIntfsRouteSeen.insert(alias);
+    }
+}
+
+/* The DEL of an interface cannot complete because its RIF is still referenced, and a SET
+ * for the interface is queued behind it. If a route was set again through the interface
+ * meanwhile, the route's DEL may have been folded into that SET, so the reference may never
+ * drain and the re-add would wait forever. A re-add into the same VRF does not need a new
+ * RIF: keep the RIF and let the queued SET update it, unless the SET changes something
+ * that is fixed when the RIF is created. */
+bool IntfsOrch::keepRifForSameVrfReAdd(const string &alias, const Port &port, const KeyOpFieldsValuesTuple &reAdd)
+{
+    const auto &fvs = kfvFieldsValues(reAdd);
+    auto it_intfs = m_syncdIntfses.find(alias);
+    if (!m_removingIntfsRouteSeen.count(alias) || it_intfs == m_syncdIntfses.end() || fvsGetValue(fvs, "vnet_name"))
+    {
+        return false;
+    }
+
+    string vrf_name = fvsGetValue(fvs, "vrf_name").value_or("");
+    sai_object_id_t vrf_id = vrf_name.empty() ? gVirtualRouterId :
+        (m_vrfOrch->isVRFexists(vrf_name) ? m_vrfOrch->getVRFid(vrf_name) : SAI_NULL_OBJECT_ID);
+    if (vrf_id != it_intfs->second.vrf_id ||
+        (port.m_type == Port::SUBPORT && fvsGetValue(fvs, "vlan").value_or("") != std::to_string(port.m_vlan_info.vlan_id)))
+    {
+        return false;
+    }
+
+    /* Undo what removing the RIF would have undone; the queued SET applies it again if configured */
+    if (it_intfs->second.sag_enabled)
+    {
+        removeLinkLocalRouteToMeSag(it_intfs->second.vrf_id);
+        it_intfs->second.sag_enabled = false;
+    }
+
+    SWSS_LOG_NOTICE("Interface %s is re-added to the same VRF; keeping its router interface", alias.c_str());
+    m_removingIntfses.erase(alias);
+    m_removingIntfsRouteSeen.erase(alias);
+    return true;
 }
 
 bool IntfsOrch::setRouterIntfsMpls(const Port &port)
@@ -1227,10 +1273,22 @@ void IntfsOrch::doTask(Consumer &consumer)
                 if (removeIntf(alias, port.m_vr_id, ip_prefix_in_key ? &ip_prefix : nullptr))
                 {
                     m_removingIntfses.erase(alias);
+                    /* A prefix DEL keeps the evidence keepRifForSameVrfReAdd() relies on */
+                    if (!ip_prefix_in_key)
+                    {
+                        m_removingIntfsRouteSeen.erase(alias);
+                    }
                     it = consumer.m_toSync.erase(it);
                 }
                 else
                 {
+                    auto next = std::next(it);
+                    if (!ip_prefix_in_key && next != consumer.m_toSync.end() && next->first == it->first &&
+                        kfvOp(next->second) == SET_COMMAND && keepRifForSameVrfReAdd(alias, port, next->second))
+                    {
+                        it = consumer.m_toSync.erase(it);
+                        continue;
+                    }
                     m_removingIntfses.insert(alias);
                     it++;
                     continue;

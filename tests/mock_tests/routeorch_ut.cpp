@@ -2006,4 +2006,34 @@ namespace routeorch_test
         ASSERT_EQ(gRouteOrch->getSyncdRouteNhgKey(gVirtualRouterId, IpPrefix("1.1.1.0/24")),
                   NextHopGroupKey("10.0.0.2@Ethernet0"));
     }
+
+    TEST_F(RouteOrchTest, IntfsOrchKeepsRifOnSameVrfReAddAfterFoldedRoute)
+    {
+        auto intfConsumer = dynamic_cast<Consumer *>(gIntfsOrch->getExecutor(APP_INTF_TABLE_NAME));
+        auto routeConsumer = dynamic_cast<Consumer *>(gRouteOrch->getExecutor(APP_ROUTE_TABLE_NAME));
+        auto rif = gIntfsOrch->getRouterIntfsId("Ethernet0");
+        ASSERT_NE(rif, SAI_NULL_OBJECT_ID);
+
+        // Ethernet0 is removed; its prefix, neighbors and routes keep the DEL pending
+        std::deque<KeyOpFieldsValuesTuple> entries;
+        entries.push_back({"Ethernet0", "DEL", {}});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+        ASSERT_TRUE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+
+        // A route's DEL was folded into its identical re-add, and Ethernet0 is re-added to the same VRF
+        entries.clear();
+        entries.push_back({"1.1.1.0/24", "SET", { {"ifname", "Ethernet0"}, {"nexthop", "10.0.0.2"} }});
+        routeConsumer->addToSync(entries);
+        static_cast<Orch *>(gRouteOrch)->doTask();
+        entries.clear();
+        entries.push_back({"Ethernet0", "SET", { {"NULL", "NULL"}, {"mac_addr", "00:00:00:00:00:00"} }});
+        intfConsumer->addToSync(entries);
+        static_cast<Orch *>(gIntfsOrch)->doTask();
+
+        // The RIF is kept and the fence lifted, so the re-add does not wait forever
+        ASSERT_FALSE(gIntfsOrch->isIntfChangeInProgress("Ethernet0"));
+        ASSERT_EQ(gIntfsOrch->getRouterIntfsId("Ethernet0"), rif);
+        ASSERT_EQ(intfConsumer->m_toSync.count("Ethernet0"), static_cast<size_t>(0));
+    }
 }

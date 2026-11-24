@@ -1091,6 +1091,12 @@ void RouteOrch::doTask(ConsumerBase& consumer)
                 {
                     /* Duplicate entry. Publish route state anyway since there could be multiple DEL, SET operations
                      * consolidated by ConsumerStateTable leading to orchagent receiving only the last SET update. */
+                    /* An identical SET may be the route's DEL and re-add folded into one; IntfsOrch
+                     * uses this to keep the RIF of an interface re-added to the same VRF meanwhile */
+                    for (const auto &nh : nhg.getNextHops())
+                    {
+                        m_intfsOrch->notifyRouteSetOnRemovingIntf(nh.alias);
+                    }
                     publishRouteState(ctx);
                     it = consumer.m_toSync.erase(it);
                 }
@@ -2193,6 +2199,11 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
             {
                 SWSS_LOG_INFO("Interface %s is being removed, retry route %s later",
                         nexthop.alias.c_str(), ipPrefix.to_string().c_str());
+                /* The installed route set again unchanged, as in the duplicate case in doTask() */
+                if (it_route != m_syncdRoutes.at(vrf_id).end() && it_route->second.nhg_key == nextHops)
+                {
+                    m_intfsOrch->notifyRouteSetOnRemovingIntf(nexthop.alias);
+                }
                 return false;
             }
         }
