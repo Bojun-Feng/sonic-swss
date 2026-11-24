@@ -10,7 +10,10 @@
 #include "intfmgr.h"
 #undef private
 
+#include <hiredis/hiredis.h>
+
 extern int (*callback)(const std::string &cmd, std::string &stdout);
+extern redisReply *mockReply;
 extern std::vector<std::string> mockCallArgs;
 extern swss::MacAddress gMacAddress;
 extern swss::MacAddress gSagMacAddress;
@@ -428,6 +431,72 @@ namespace intfmgr_ut
         mockCallArgs.clear();
         EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Vlan200"}, {{"static_anycast_gateway", "invalid"}}, SET_COMMAND));
         EXPECT_FALSE(commandWasIssued("bridge fdb"));
+    }
+
+    static std::size_t intfDelsAtVrfUnbind = 0;
+
+    TEST_F(IntfMgrTest, testRootDeletePublishedBeforeVrfUnbind)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_statePortTable.set("Ethernet4", {{"state", "ok"}});
+        intfmgr.m_stateIntfTable.set("Ethernet4", {{"vrf", ""}});
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet4"}, {}, SET_COMMAND));
+
+        // orchagent gets the DEL before the Linux VRF change makes FRR and neighsyncd publish
+        testing_db::resetOperationCounters();
+        intfDelsAtVrfUnbind = 0;
+        callback = [](const std::string &cmd, std::string &stdout) {
+            if (cmd.find(" nomaster") != std::string::npos)
+            {
+                intfDelsAtVrfUnbind = testing_db::getProducerDelCount(APP_INTF_TABLE_NAME);
+            }
+            return cb(cmd, stdout);
+        };
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet4"}, {}, DEL_COMMAND));
+        EXPECT_EQ(intfDelsAtVrfUnbind, 1u);
+    }
+
+
+    TEST_F(IntfMgrTest, testRootDeleteFailsClosedUntilConsumed)
+    {
+        swss::IntfMgr intfmgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_intf_tables);
+        intfmgr.m_statePortTable.set("Ethernet4", {{"state", "ok"}});
+        intfmgr.m_stateVrfTable.set("Vrf_b", {{"state", "ok"}});
+        intfmgr.m_stateIntfTable.set("Ethernet4", {{"vrf", "Vrf_a"}});
+
+        // orchagent has not taken the DEL: the key is still in INTF_TABLE_KEY_SET
+        mockReply = (redisReply *)calloc(1, sizeof(redisReply));
+        mockReply->type = REDIS_REPLY_INTEGER;
+        mockReply->integer = 1;
+        testing_db::resetOperationCounters();
+        mockCallArgs.clear();
+
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet4"}, {}, DEL_COMMAND));
+        EXPECT_EQ(testing_db::getProducerDelCount(APP_INTF_TABLE_NAME), 1u);
+        EXPECT_FALSE(commandWasIssued(" nomaster"));
+
+        // The re-add into another VRF is held, not dropped as a direct VRF change and not applied
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet4"}, {{"vrf_name", "Vrf_b"}}, SET_COMMAND));
+        EXPECT_FALSE(commandWasIssued(" master "));
+        // and so is an address
+        EXPECT_FALSE(intfmgr.doIntfAddrTask({"Ethernet4", "10.0.0.1/31"}, {}, SET_COMMAND));
+
+        // A retry does not publish the DEL again and still does not touch Linux
+        EXPECT_FALSE(intfmgr.doIntfGeneralTask({"Ethernet4"}, {}, DEL_COMMAND));
+        EXPECT_EQ(testing_db::getProducerDelCount(APP_INTF_TABLE_NAME), 1u);
+        EXPECT_FALSE(commandWasIssued(" nomaster"));
+
+        // orchagent takes the DEL: the delete completes, then the held re-add goes through
+        mockReply->integer = 0;
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet4"}, {}, DEL_COMMAND));
+        EXPECT_TRUE(commandWasIssued("/sbin/ip link set \"Ethernet4\" nomaster"));
+        EXPECT_EQ(testing_db::getProducerDelCount(APP_INTF_TABLE_NAME), 1u);
+        EXPECT_EQ(intfmgr.m_delPending.count("Ethernet4"), 0u);
+        EXPECT_TRUE(intfmgr.doIntfGeneralTask({"Ethernet4"}, {{"vrf_name", "Vrf_b"}}, SET_COMMAND));
+        EXPECT_TRUE(commandWasIssued("/sbin/ip link set \"Ethernet4\" master \"Vrf_b\""));
+
+        free(mockReply);
+        mockReply = nullptr;
     }
 
 }

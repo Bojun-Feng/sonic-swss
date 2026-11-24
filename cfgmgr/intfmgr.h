@@ -5,6 +5,7 @@
 #include "producerstatetable.h"
 #include "orch.h"
 
+#include <chrono>
 #include <map>
 #include <string>
 #include <set>
@@ -29,6 +30,14 @@ public:
     using Orch::doTask;
 
 private:
+    DBConnector *m_appDb;
+    /* Interfaces whose APPL_DB INTF_TABLE DEL is published but not taken by orchagent yet */
+    struct DelPending
+    {
+        std::chrono::steady_clock::time_point published;
+        std::chrono::steady_clock::time_point warned;
+    };
+    std::map<std::string, DelPending> m_delPending;
     ProducerStateTable m_appIntfTableProducer, m_appSagTableProducer;
     Table m_cfgIntfTable, m_cfgVlanIntfTable, m_cfgLagIntfTable, m_cfgLoopbackIntfTable, m_cfgSagTable;
     Table m_statePortTable, m_stateLagTable, m_stateVlanTable, m_stateVrfTable, m_stateIntfTable, m_appLagTable;
@@ -60,6 +69,7 @@ private:
     bool isIntfCreated(const std::string &alias);
     bool isIntfChangeVrf(const std::string &alias, const std::string &vrfName);
     int getIntfIpCount(const std::string &alias);
+    bool waitRootDeleteConsumed(const std::string &alias, std::chrono::milliseconds bound);
     void buildIntfReplayList(void);
     void setWarmReplayDoneState();
 

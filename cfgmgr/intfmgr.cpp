@@ -12,6 +12,8 @@
 #include "subscriberstatetable.h"
 #include <swss/redisutility.h>
 #include "subintf.h"
+#include <chrono>
+#include <thread>
 
 using namespace std;
 using namespace swss;
@@ -32,6 +34,7 @@ extern MacAddress gSagMacAddress;
 
 IntfMgr::IntfMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
         Orch(cfgDb, tableNames),
+        m_appDb(appDb),
         m_cfgIntfTable(cfgDb, CFG_INTF_TABLE_NAME),
         m_cfgVlanIntfTable(cfgDb, CFG_VLAN_INTF_TABLE_NAME),
         m_cfgLagIntfTable(cfgDb, CFG_LAG_INTF_TABLE_NAME),
@@ -396,6 +399,33 @@ bool IntfMgr::isIntfChangeVrf(const string &alias, const string &vrfName)
     return false;
 }
 
+bool IntfMgr::waitRootDeleteConsumed(const string &alias, chrono::milliseconds bound)
+{
+    /* Wait, at most `bound`, until orchagent has popped the interface DEL (macsecmgrd waits
+     * for orchagent to take its own DEL before a new MKA session, #4994). orchagent hands a
+     * popped INTF_TABLE batch to IntfsOrch before it pops anything else, so routes and neighbors
+     * triggered by the Linux changes that follow reach orchagent after IntfsOrch has the DEL.
+     * Only the key set of INTF_TABLE's Redis ProducerStateTable is read: intfmgrd holds the writes
+     * a VRF move makes for the alias while the DEL is pending, so none of them can fold into it
+     * (orchagent does not offer INTF_TABLE over ZMQ). */
+    const auto deadline = chrono::steady_clock::now() + bound;
+    while (true)
+    {
+        RedisCommand command;
+        command.format("SISMEMBER %s %s", m_appIntfTableProducer.getKeySetName().c_str(), alias.c_str());
+        RedisReply reply(m_appDb, command, REDIS_REPLY_INTEGER);
+        if (reply.getContext()->integer == 0)
+        {
+            return true;
+        }
+        if (chrono::steady_clock::now() >= deadline)
+        {
+            return false;
+        }
+        this_thread::sleep_for(chrono::milliseconds(2));
+    }
+}
+
 void IntfMgr::addHostSubIntf(const string&intf, const string &subIntf, const string &vlan)
 {
     stringstream cmd;
@@ -481,6 +511,11 @@ void IntfMgr::updateSubIntfMtu(const string &alias, const string &mtu)
         subIntf subIf(intf);
         if (subIf.parentIntf() == alias)
         {
+            /* Its DEL is published and pending in orchagent: a SET now would be folded into it */
+            if (m_delPending.count(intf))
+            {
+                continue;
+            }
             std::vector<FieldValueTuple> fvVector;
 
             string subif_config_mtu = m_subIntfList[intf].mtu;
@@ -538,6 +573,11 @@ void IntfMgr::updateSubIntfAdminStatus(const string &alias, const string &admin)
         subIntf subIf(intf);
         if (subIf.parentIntf() == alias)
         {
+            /* Its DEL is published and pending in orchagent: a SET now would be folded into it */
+            if (m_delPending.count(intf))
+            {
+                continue;
+            }
             /*  Avoid duplicate interface admin UP event. */
             string curr_admin = m_subIntfList[intf].currAdminStatus;
             if (curr_admin == "up" && curr_admin == admin)
@@ -900,6 +940,13 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
 
     if (op == SET_COMMAND)
     {
+        /* The DEL of the previous configuration is not taken by orchagent yet: hold this update */
+        if (m_delPending.count(alias))
+        {
+            SWSS_LOG_DEBUG("Interface %s delete is pending in orchagent, skipping", alias.c_str());
+            return false;
+        }
+
         if (!isIntfStateOk(parentAlias.empty() ? alias : parentAlias))
         {
             SWSS_LOG_DEBUG("Interface is not ready, skipping %s", alias.c_str());
@@ -1176,6 +1223,35 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             return false;
         }
 
+        /* Publish the DEL before changing Linux: the VRF change below makes FRR and
+         * neighsyncd publish routes and neighbors at once, and orchagent must see the
+         * DEL first so that they cannot bind the old RIF (sonic-buildimage#28619). */
+        /* Fail closed: Linux is never changed before orchagent has taken the DEL. If it has not
+         * taken it yet, the task is retried, without publishing the DEL again, and the later
+         * updates of the interface are held meanwhile so that none of them can be folded into
+         * the pending DEL (sonic-swss#4924). */
+        auto pending = m_delPending.find(alias);
+        bool firstAttempt = pending == m_delPending.end();
+        if (firstAttempt)
+        {
+            m_appIntfTableProducer.del(alias);
+            pending = m_delPending.emplace(alias, DelPending{chrono::steady_clock::now(), chrono::steady_clock::time_point()}).first;
+        }
+        if (!waitRootDeleteConsumed(alias, firstAttempt ? chrono::milliseconds(1000) : chrono::milliseconds(0)))
+        {
+            auto now = chrono::steady_clock::now();
+            auto waited = chrono::duration_cast<chrono::seconds>(now - pending->second.published);
+            if (waited >= chrono::seconds(10) &&
+                (pending->second.warned == chrono::steady_clock::time_point() || now - pending->second.warned >= chrono::seconds(60)))
+            {
+                SWSS_LOG_WARN("orchagent has not taken the %s delete for %d s; the interface is not changed in Linux until it does",
+                              alias.c_str(), (int)waited.count());
+                pending->second.warned = now;
+            }
+            return false;
+        }
+        m_delPending.erase(pending);
+
         setIntfVrf(alias, "");
 
         if (is_lo)
@@ -1214,7 +1290,6 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
             m_sagIntfList.erase(alias);
         }
 
-        m_appIntfTableProducer.del(alias);
         m_stateIntfTable.del(alias);
     }
     else
@@ -1241,7 +1316,7 @@ bool IntfMgr::doIntfAddrTask(const vector<string>& keys,
          * Don't proceed if port/LAG/VLAN/subport and intfGeneral is not ready yet.
          * The pending task will be checked periodically and retried.
          */
-        if (!isIntfStateOk(alias) || !isIntfCreated(alias))
+        if (!isIntfStateOk(alias) || !isIntfCreated(alias) || m_delPending.count(alias))
         {
             SWSS_LOG_DEBUG("Interface is not ready, skipping %s", alias.c_str());
             return false;
